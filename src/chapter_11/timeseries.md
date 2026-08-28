@@ -7,6 +7,8 @@
 - `Date` = i32（自纪元天数）、`Datetime` = i64（时间戳，默认微秒精度）
 - 时区处理：`dt.replace_time_zone` 挂时区标签、`dt.convert_time_zone` 换算显示
 
+这两条分别对应"存储"与"解释"两层：物理层上日期时间就是整数列，本章一切快操作的速度都源于此；语义层上时区只是挂在时间戳上的解释规则，`replace_time_zone` 与 `convert_time_zone` 的分野全在"改不改绝对时刻"。先看物理表示——用 `to_physical` 直接看存储。
+
 ```python
 import polars as pl
 from datetime import datetime, date
@@ -90,6 +92,8 @@ utc.with_columns(pl.col("ts").dt.convert_time_zone("Asia/Shanghai"))
 
 - `rolling_mean` / `rolling_sum` 等的窗口机制
 - `rolling` vs `group_by_dynamic` 选型
+
+窗口机制的要点是输出与输入等长：每个位置聚合自己窗口内的观测，rolling 家族永不改变行数——这一条就与"每窗一行"的重采样划清了界限。选型的第一问因此不是"用哪个函数"，而是"窗口按什么对齐"——按行数还是按时间：间隔规则时两者难分彼此，数据一有缺孔，固定行数窗口会把语义上早已"过期"的观测照常聚进来（rolling_*_by 一节有逐行对照的实例）。至于"窗口越长越慢"的直觉是否成立，下面先用一次 500 万行实测来裁决。
 
 ```python
 # 滚动指标：组内并行计算
@@ -220,6 +224,8 @@ monthly.with_columns(
 - `pct_change(n)`：相对 n 期前的变化率
 - 分组内 period-over-period（按年分组的同比）
 - 缺失周期补齐：`upsample` 后再算环比，避免错位比较
+
+环比的算术本体就是 shift：把上一期的值平移到当前行，两行相除。`pct_change(n)` 是它的封装——相对 n 期前的变化率，n=12 就是月度数据的同比。分组场景的全部要点在 `over`：shift 必须被限制在组内，否则每组第一期的"上一期"会错拿相邻用户的数据。而最隐蔽的坑是周期缺失：`pct_change` 只看行位置、不看日历，缺了 2 月，1 月的下一行就是 3 月——一个"看似正常"的 30% 其实是两个月累计涨幅，所以先 `upsample` 补齐周期再算环比是正确性前提。
 
 ```python
 # 组内环比：每个用户自己的月度趋势

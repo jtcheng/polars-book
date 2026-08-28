@@ -19,6 +19,8 @@ flowchart LR
 - `fill_null` / `drop_nulls` / `forward_fill` 策略
 - bitmap 操作的向量化成本
 
+null 与 NaN 的区分不是学究气：null 表示"值缺席"，任何 dtype 都可能有；NaN 是 IEEE 754 浮点的合法取值，只出现在浮点列——`is_null` 看不见 NaN，`fill_null` 也填不掉它，两套语义混用会让脏数据静默穿透整条管道。策略按场景选：慢变时序信号（温度、状态位）适合组内 `forward_fill`，前提是"短时间内值不变"的假设成立；缺失本身是信息（用户未提交、采集失败）就用 `is_null` 标记成新列，把填补决策留给下游；浮点列则先 `fill_nan(None)` 把两套缺失统一成 null 再处理。`drop_nulls` 最省事也最危险——它直接删行，一切依赖行数的统计（均值、占比）的分母都被悄悄改写。
+
 ```python
 import polars as pl
 
@@ -90,6 +92,8 @@ for label, fn in [
 - 数值降宽（Int64 → Int32）的溢出风险
 - `to_datetime` 的格式显式声明
 
+cast 的设计哲学是"快失败"：默认 strict 让脏数据在转换点当场报错，定位在发生处；`strict=False` 把失败吞成 null、管道不中断，代价是发现被推迟到下游——生产管道用前者保正确性，一次性脏数据探查用后者统计转不动的行数。降宽的溢出同样是显式失败而非静默截断：实测（polars 1.44.1）Int64 的 30 亿 cast 到 Int32，strict 下抛 `InvalidOperationError`，`strict=False` 下变 null——真正的风险不在引擎而在流程：没人确认过上界，自增 id 迟早突破 21 亿。日期解析要求显式格式也是同一原则——推断可能猜错格式，显式声明把歧义消灭在读入时。
+
 ```python
 # strict（默认）：转换失败直接报错——生产管道推荐
 pl.DataFrame({"x": ["1", "2", "abc"]}).select(
@@ -118,6 +122,8 @@ df.with_columns(pl.col("flag").cast(pl.Int8))   # 上限 127
 - 多编码：`len_bytes` vs `len_chars`
 - 正则的预编译与回退成本
 
+`.str` 命名空间快在执行层级：每个方法对应一个列级向量化内核，一次原生调用处理整列，而不是 Python 层的逐行调度——这是它能留在快路径的原因，也是边界：内核没实现的复杂逻辑才需要退到 `map_elements`。`len_chars` 与 `len_bytes` 的分歧来自 UTF-8 变长编码——"数据"两个字符占 6 个字节——截断、过滤、分箱时选错语义，中文场景直接出错。正则的成本另算：`literal=True` 走纯子串搜索，进正则引擎则模式越复杂常数越大（实测 200 万行 `contains("hij")`：literal 约 14 ms，正则模式 `ab.*hij` 约 40 ms，约 3 倍差距）——高频路径上的字面量匹配值得显式声明。
+
 ```python
 df = pl.DataFrame({
     "email": ["  Alice@Corp.COM ", "bob@corp.com", None],
@@ -144,6 +150,8 @@ print(s.str.len_bytes())   # [6, 3]  UTF-8 存储字节数
 - `Categorical` vs `Enum` 选型
 - 跨字典 join 的自动 remap（1.x 行为）
 - 物理表示：u32 索引 + 字典
+
+字典编码的收益直接来自物理表示：列里存的不再是字符串而是 u32 索引，重复率越高、字符串越长省得越多；join 键与 group_by 键的比较也从逐字节字符串比较变成整数比较。选型只问一句——类别集合是否先验封闭：运行时才能枚举全的用 `Categorical`（字典随数据生长），类别封闭且想尽早拦住脏值的用 `Enum`（声明即校验，未知取值当场报错）。至于跨字典 join，引擎的自动 remap 是一次性线性开销，不必为它预先统一两侧编码——细节见下面两小节。
 
 ```python
 # 低基数字符串列：内存与比较性能双赢

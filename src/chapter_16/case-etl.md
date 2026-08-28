@@ -7,6 +7,8 @@
 - 输入：业务数据库 CDC 导出、上游 CSV
 - 输出：分区 Parquet 数据湖 + 派生表
 
+输入端的 CDC 流与普通批量数据有本质区别：每行携带 op 标记（I=插入、U=更新、D=删除），同一个 order_id 会跨批次反复出现，入湖时必须按 op 语义决定合并策略——I 视为新行、U 覆盖旧值、D 剔除对应记录，否则更新会堆积成重复行、删除会被无声忽略。本章取最简一档：按 ts 排序后 `unique(keep="last")` 保住每个主键的最新状态（示例数据只含 I/U，见 16.2）。输出端的分区 Parquet 则是 Polars 与 DuckDB 的公共底座：Polars 用 sink 按日期分区写入，DuckDB 用同一套 glob 语法直接查询这份数据湖——读写双方共享一份数据、无需导出转换，这正是 16.3 协作模式的前提。
+
 ```mermaid
 flowchart LR
     A["业务库 CDC"] --> B["scan_csv / scan_parquet"]

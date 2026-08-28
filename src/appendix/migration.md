@@ -7,6 +7,8 @@
 - `DeprecationWarning` 全量打印：`python -W error::DeprecationWarning`
 - 官方 release notes：每版本的 API 变更清单
 
+两条路径覆盖不同的时间尺度：warning 是"当下"——升级后把弃用当场变成异常抛出，在 API 真正移除（通常发生在弃用后若干版本）之前留出迁移窗口；release notes 是"将来"——逐版本的 API 变更清单，用来预判哪些变更会落到自己头上。只靠其中一条都会漏：warning 看不到尚未弃用但即将变更的 API，notes 则不会指出你的代码哪一行踩中了变更——前者要主动跑全量测试，后者要人工对照清单。两者配合，锁版本下的例行升级才不会变成赌运气。
+
 ## C.2 版本路线
 
 | 版本 | 关键节点 |

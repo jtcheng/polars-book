@@ -1,0 +1,30 @@
+name: Version Patrol
+
+# 每周一 09:00 (UTC+8) 用最新 polars 跑书稿测试套件
+# 目的：polars 发布 breaking change 时尽早发现书中代码失效
+on:
+  schedule:
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+jobs:
+  latest-polars:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Test with latest polars
+        run: |
+          uv venv
+          uv pip install polars numpy pandas pytest --upgrade
+          uv run pytest tests/ -q
+
+      - name: Audit book structure
+        run: python3 scripts/audit_book.py
+
+      - name: Report versions
+        run: |
+          uv run python -c "import polars; print('polars', polars.__version__)"

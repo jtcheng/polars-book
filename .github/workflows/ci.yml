@@ -30,6 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 书稿结构审计
+        run: uv run python scripts/audit_book.py
+
       - name: 安装 mdbook
         uses: peaceiris/actions-mdbook@v2
         with:

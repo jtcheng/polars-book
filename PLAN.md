@@ -172,7 +172,7 @@ df.select(cs.temporal(), cs.by_dtype(pl.String))
 
 ## 五、mermaid 图示规划
 
-全书约 24 张图，类型分配：
+全书 17 张图（实际交付数），类型分配：
 
 | 类型 | 数量 | 用途 |
 |---|---|---|

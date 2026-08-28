@@ -30,7 +30,7 @@ print(df.group_by("dept").agg(
 ))
 ```
 
-- 命名聚合：`pl.col("x").agg(...)` 形式
+- 命名聚合：`group_by().agg(total=pl.col("x").sum())` 形式
 - 聚合结果展开：`explode` / `flatten`
 
 ### 高效统计三件套（探索阶段省时利器）
@@ -102,7 +102,7 @@ df.with_columns(pl.col("salary").mean().over("dept"))  # 广播回每行
 flowchart TD
     J{"join 需求"} -->|"两表都只要匹配行"| INNER["inner"]
     J -->|"保留左表全部"| LEFT["left"]
-    J -->|"保留两表全部"| OUTER["outer(coalesce=True)"]
+    J -->|"保留两表全部"| FULL["full(coalesce=True)"]
     J -->|"只筛选不取列"| SEMI["semi（存在即保留）"]
     J -->|"反向筛选"| ANTI["anti（不存在才保留）"]
     J -->|"笛卡尔组合"| CROSS["cross"]
@@ -113,11 +113,11 @@ flowchart TD
 |---|---|---|
 | `inner` | 两侧匹配 | 哈希 join，右表建哈希 |
 | `left` / `right` | 保留一侧 | 哈希 + null 填充 |
-| `outer(coalesce)` | 全保留 | 哈希 + 双侧补齐，键可选合并 |
+| `full(coalesce)` | 全保留（1.0 起 `outer` 改名 `full`） | 哈希 + 双侧补齐，键可选合并 |
 | `cross` | 笛卡尔积 | O(n·m)，慎用 |
 | `semi` | 只保留左表中存在于右表的行 | 不膨胀 |
 | `anti` | 只保留左表中不存在于右表的行 | 不膨胀 |
-| `join_asof` | 按时序最近邻匹配 | 需 `set_sorted`，滑动匹配 |
+| `join_asof` | 按时序最近邻匹配 | 要求数据按 on 键有序（`set_sorted` 可跳过检查） |
 
 ```python
 orders = pl.DataFrame({
@@ -131,7 +131,7 @@ users = pl.DataFrame({
 
 # inner：只保留双方都有的
 orders.join(users, on="user_id", how="inner")
-# ┌ user_id ┬ amount ┬ name ┐   （3 行：1、2）
+# ┌ user_id ┬ amount ┬ name ┐   （2 行：1、2）
 
 # left：保留左表全部
 orders.join(users, on="user_id", how="left")
@@ -222,7 +222,7 @@ df.group_by("dept").agg(pl.col("salary").sum()).sort("dept")
 
 ## 练习
 
-1. **join 语义**：构造左表 4 行、右表 3 行（有部分键重叠），分别执行七种 join（inner/left/right/outer/cross/semi/anti），写下每个输出的行数与列，自制一张速查表。
+1. **join 语义**：构造左表 4 行、右表 3 行（有部分键重叠），分别执行七种 join（inner/left/right/full/cross/semi/anti），写下每个输出的行数与列，自制一张速查表。
 2. **IQR 实战**：生成含 1% 极端值的 100 万行数据，用 10.2 节的 IQR 模板剔除异常值，再对比剔除前后的 mean 与 median 的变化。
 3. **环比聚合**：给定带 null 的分组数据，同时输出每组的 `pl.len()` 与 `count()`，解释两者何时相等、何时不等。
 4. **膨胀检测**：对一个 1:N 的 join 写出"预检右表键是否重复"的表达式，并在 join 前先收窄右表。

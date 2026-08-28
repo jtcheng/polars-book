@@ -4,7 +4,7 @@
 
 ## 15.1 场景与数据
 
-- 输入：行情快照（分钟 K 线）、交易信号表、证券主数据
+- 输入：行情快照（日线 K 线）、交易信号表、证券主数据
 - 输出：回测收益、最大回撤、夏普比率
 
 ```python
@@ -14,6 +14,50 @@ import polars as pl
 bars = pl.scan_parquet("bars.parquet")        # symbol, ts, open, high, low, close, volume
 signals = pl.scan_parquet("signals.parquet")  # symbol, ts, side, qty
 symbols = pl.scan_parquet("symbols.parquet")  # symbol, name, sector (低基数)
+```
+
+先运行一次下面的数据生成（2 个 symbol × 500 根日线 K 线），本章代码即可顺序执行：
+
+```python
+from datetime import datetime
+import numpy as np
+
+rng = np.random.default_rng(42)
+ts = pl.datetime_range(
+    datetime(2024, 8, 1), datetime(2026, 12, 31), "1d", eager=True
+).head(500)
+
+frames = []
+for sym in ["AAPL", "MSFT"]:
+    n = len(ts)
+    close = 100 + np.cumsum(rng.normal(0.05, 1.0, n))   # 随机游走价格
+    frames.append(pl.DataFrame({
+        "symbol": sym,
+        "ts": ts,
+        "open": close + rng.normal(0, 0.2, n),
+        "high": close + np.abs(rng.normal(0, 0.5, n)),
+        "low": close - np.abs(rng.normal(0, 0.5, n)),
+        "close": close,
+        "volume": rng.integers(1_000, 50_000, n),
+    }))
+pl.concat(frames).write_parquet("bars.parquet")
+
+sig_frames = []
+for sym in ["AAPL", "MSFT"]:
+    idx = rng.choice(len(ts), 80, replace=False)        # 每个标的 80 笔随机信号
+    sig_frames.append(pl.DataFrame({
+        "symbol": sym,
+        "ts": ts[idx],
+        "side": rng.choice(["BUY", "SELL"], 80),
+        "qty": rng.integers(10, 200, 80),
+    }))
+pl.concat(sig_frames).write_parquet("signals.parquet")
+
+pl.DataFrame({
+    "symbol": ["AAPL", "MSFT"],
+    "name": ["Apple Inc.", "Microsoft Corp."],
+    "sector": ["Tech", "Tech"],
+}).write_parquet("symbols.parquet")
 ```
 
 ## 15.2 多表 join 组装宽表
@@ -27,7 +71,7 @@ filled = (
       .join_asof(bars_sorted, on="ts", by="symbol", strategy="backward")
       # 主数据 join：sector 是低基数 → Categorical 提速
       .join(
-          symbols.with_columns(pl.col("sector").cast(pl.Categorical)).collect(),
+          symbols.with_columns(pl.col("sector").cast(pl.Categorical)),
           on="symbol", how="left",
       )
 )
@@ -36,16 +80,17 @@ filled = (
 ## 15.3 rolling 指标与信号计算
 
 ```python
-signals = (
+daily = (
     pl.scan_parquet("bars.parquet")
     .with_columns(
         ma_fast=pl.col("close").rolling_mean(20).over("symbol"),
         ma_slow=pl.col("close").rolling_mean(60).over("symbol"),
-        # ATR 波动率：rolling + 高低价
-        atr=(((pl.col("high") - pl.col("low"))
-              + (pl.col("high") - pl.col("close").shift(1)).abs()
-              + (pl.col("low") - pl.col("close").shift(1)).abs()) / 3)
-             .rolling_mean(14).over("symbol"),
+        # ATR 波动率：标准 True Range = 三项取 max，再滚动平均
+        atr=pl.max_horizontal(
+              pl.col("high") - pl.col("low"),
+              (pl.col("high") - pl.col("close").shift(1)).abs(),
+              (pl.col("low") - pl.col("close").shift(1)).abs(),
+             ).rolling_mean(14).over("symbol"),
     )
     .with_columns(
         # 布尔信号本身就是向量化表达式
@@ -73,15 +118,17 @@ backtest = (
     .sort("day")
     .with_columns(
         ret=pl.col("daily_pnl") / pl.col("daily_pnl").shift(1).abs(),
-        # 组内环比：滚动夏普
+    )
+    .with_columns(
+        # 滚动夏普：ret 定义在上一个 with_columns 中，同层引用会报 ColumnNotFoundError
         rolling_sharpe=(pl.col("ret").mean() / pl.col("ret").std()).over(
-            pl.int_range(pl.len()).floor_div(30)  # 30 日滚动窗口（示意）
+            pl.int_range(pl.len()) // 30  # 30 日滚动窗口（示意）
         ),
     )
-    # 最大回撤：累计收益的 rolling max 与当前值之差
+    # 最大回撤：累计收益的全程峰值（cum_max）与当前值之差
     .with_columns(cum=pl.col("daily_pnl").cum_sum())
     .with_columns(
-        drawdown=pl.col("cum") - pl.col("cum").rolling_max(252).shift(1)
+        drawdown=pl.col("cum") - pl.col("cum").cum_max()
     )
     .collect()
 )
@@ -97,22 +144,23 @@ backtest = (
 # 每个分区内 rolling 串行，分区间并行
 # 对比：错误写法（无 over）会把所有证券的 K 线混在一个窗口里
 
-# join_asof 的前提：双表都按 ts 排序且 set_sorted
-# 忘记这一步 → 运行时报错（好）或静默错误匹配（坏）
+# set_sorted 是向引擎"承诺"有序：跳过有序性检查，省一次全表排序
+# 若数据实际无序而强行声明，join_asof 会静默给出错误匹配（见练习 2）
 ```
 
 ## 15.6 避免逐标的循环
 
 ```python
-# ❌ 反模式：5000 个标的循环回测
-for symbol in symbols_list:
-    df_sym = bars.filter(pl.col("symbol") == symbol)   # 5000 次全表扫描
-    run_backtest(df_sym)
+# ❌ 反模式：5000 个标的循环回测（示意，勿运行）
+# symbols_list = bars.select("symbol").unique()["symbol"]  # 5000 个标的
+# for symbol in symbols_list:
+#     df_sym = bars.filter(pl.col("symbol") == symbol)     # 5000 次全表扫描
+#     run_backtest(df_sym)                                 # 每个标的从头执行一遍管道
 
 # ✅ 向量化：一次扫描，over 分区并行处理全部标的
 bars.with_columns(
     pl.col("close").rolling_mean(20).over("symbol")
-)
+).collect().head(3)
 # 提速典型值：几十倍——不仅省了循环，还让优化器看到全貌
 ```
 
@@ -132,5 +180,5 @@ bars.with_columns(
 ## 练习
 
 1. **金叉验证**：构造单调上升后转跌的价格序列，用 15.3 节表达式计算 golden_cross，验证信号恰好在均线交叉的那一根 K 线为 True。
-2. **排序前提**：故意不执行 `set_sorted` 直接 `join_asof`，观察报错信息；修复后再验证对齐结果（每笔成交的 close 来自它之前最近一根 K 线）。
-3. **回撤计算**：构造一条先涨后跌的收益曲线，用 15.4 节的 `cum_sum + rolling_max` 计算最大回撤，手工验证峰值谷值。
+2. **排序前提**：把 `bars` 的行顺序打乱（如 `bars.collect().sample(fraction=1.0, shuffle=True)`）后直接 `join_asof`，观察引擎并不报错、但 close 对齐结果悄悄错乱；再 `sort("ts").set_sorted("ts")` 后重算，对比两种结果——体会 `set_sorted` 是"承诺"而非"保证"。
+3. **回撤计算**：构造一条先涨后跌的收益曲线，用 15.4 节的 `cum_sum + cum_max` 计算最大回撤，手工验证峰值谷值。

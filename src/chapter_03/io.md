@@ -38,7 +38,7 @@ lf = (
       .select(["user_id", "amount"])      # 投影裁剪
 )
 print(lf.explain())
-# 输出中可见 SELECTION: [(col("amount")) > (1000)]
+# 输出中可见 SELECTION: col("amount") > 1000
 # 与 PROJECT 2/12 COLUMNS —— 12 列只读 2 列
 ```
 
@@ -60,7 +60,7 @@ lf = pl.scan_csv(
     "events.csv",
     schema_overrides={
         "user_id": pl.Int64,
-        "ts": pl.Datetime,            # 或 parse_dates=True
+        "ts": pl.Datetime,            # 或 try_parse_dates=True
         "city": pl.Categorical,
     },
     null_values=["", "NULL", "\\N"],

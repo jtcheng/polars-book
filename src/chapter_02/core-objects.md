@@ -22,7 +22,7 @@ classDiagram
     class Expr {
         +col/lit/when
         +str/dt/cat/list/struct
-        +map_lazy(lambda)
+        +map_elements(func)
     }
     DataFrame "1" o-- "n" Series : 列组成
     Series <.. Expr : 表达式求值于
@@ -90,17 +90,18 @@ flowchart LR
 ```python
 import polars as pl
 
-df = pl.DataFrame({
-    "id": pl.int_range(0, 1_000_000, dtype=pl.Int64),
-    "flag": (pl.int_range(0, 1_000_000, dtype=pl.Int64) % 2 == 0),
-})
+df = pl.select(
+    id=pl.int_range(0, 1_000_000, dtype=pl.Int64),
+    flag=(pl.int_range(0, 1_000_000, dtype=pl.Int64) % 2 == 0),
+)
 
-print(df.estimated_size("mb"))  # ≈ 9.5 MB
+print(df.estimated_size("mb"))  # ≈ 7.7 MB
 # Int64 (8B) + Bool (1B) × 100 万行
+# Bool 按位打包：每行约 8 + 1/8 = 8.125 字节
 
 # 收窄 dtype 立省一半
 df2 = df.with_columns(pl.col("id").cast(pl.Int32))
-print(df2.estimated_size("mb"))  # ≈ 5.7 MB
+print(df2.estimated_size("mb"))  # ≈ 3.9 MB
 ```
 
 ### null 与 NaN 是两回事
@@ -108,7 +109,7 @@ print(df2.estimated_size("mb"))  # ≈ 5.7 MB
 ```python
 s = pl.Series("x", [1.0, None, float("nan")])
 print(s.is_null())   # [False, True, False]  值缺失
-print(s.is_nan())    # [False, False, True]  浮点未定义
+print(s.is_nan())    # [False, None, True]   浮点未定义；null 位置传播为 null
 print(s.sum())       # nan 会传染；null 会被跳过 → 1.0 + nan = nan
 # 聚合前先处理：
 s.fill_nan(0).sum()          # 或先 fill_nan 再算
@@ -143,6 +144,7 @@ print(df_cat.get_column("city").to_physical())  # 字典索引 [0,1,0,2]
 - DataFrame 是列的集合；Expr 是计算的描述而非执行
 - Arrow 列式布局带来缓存友好、SIMD 可用、跨系统零拷贝
 - null（bitmap 标记）与 NaN（浮点值）语义不同，处理方式也不同
+- 列式布局是后续流式引擎分块（morsel）处理的前提——按列切块才能逐块流过计算内核
 
 ## 性能检查清单
 

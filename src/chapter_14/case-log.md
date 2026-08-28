@@ -9,10 +9,33 @@
 
 ```python
 # 数据形态示例
-# logs/date=2026-08-01/part-000.parquet
-# logs/date=2026-08-02/part-000.parquet
+# logs/date=2026-08-27/part-000.parquet
+# logs/date=2026-08-28/part-000.parquet
 # 列：ts (Datetime), level (String), endpoint (String),
 #     latency_ms (Int64), user_id (Int64)
+```
+
+先运行一次数据生成（2 个日期分区 × 2000 行日志），本章代码即可顺序执行：
+
+```python
+import polars as pl
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import numpy as np
+
+rng = np.random.default_rng(11)
+for day in [date(2026, 8, 27), date(2026, 8, 28)]:
+    part = Path(f"logs/date={day.isoformat()}")
+    part.mkdir(parents=True, exist_ok=True)
+    n = 2000
+    pl.DataFrame({
+        "ts": [datetime(2026, 8, day.day) + timedelta(minutes=int(i))
+               for i in rng.integers(0, 1440, n)],
+        "level": rng.choice(["INFO"] * 6 + ["WARN"] * 2 + ["ERROR"] * 2, n),
+        "endpoint": rng.choice(["/api/a", "/api/b", "/api/c", "/api/d"], n),
+        "latency_ms": rng.integers(5, 2000, n),
+        "user_id": rng.integers(1, 100, n),
+    }).sort("ts").write_parquet(part / "part-000.parquet")
 ```
 
 ## 14.2 端到端流式管道
@@ -50,8 +73,8 @@ print(lf.explain())
 ### TopN 的两阶段：先聚合再 sort
 
 ```python
-# ❌ 错误直觉：对原始数据 sort 再取头
-big.sort("latency_ms", descending=True).head(100)
+# ❌ 错误直觉：对原始数据 sort 再取头（10 亿行全量排序，示意勿运行）
+# big.sort("latency_ms", descending=True).head(100)
 
 # ✅ 正确策略：先聚合（收窄到端点粒度），再排序
 (pl.scan_parquet("logs/date=2026-08-*/*.parquet")
@@ -63,24 +86,15 @@ big.sort("latency_ms", descending=True).head(100)
 # 聚合后只有 ~200 行，sort 成本可忽略
 ```
 
-## 14.4 扩展练习
+## 14.4 增量运行与监控
 
 ### 增量运行：只处理新增分区
 
 ```python
-from datetime import date, timedelta
-from pathlib import Path
-
-def new_partitions(root: str, watermark: date) -> list[str]:
-    return sorted(
-        str(p) for p in Path(root).glob("date=*")
-        if date.fromisoformat(p.name.split("=")[1]) > watermark
-    )
-
 # anti join 去重：排除已入库的小时（幂等保证）
 already = pl.scan_parquet("error_stats.parquet").select("hour", "endpoint")
 
-(pl.scan_parquet("logs/date=2026-08-2*/*.parquet")
+(pl.scan_parquet("logs/date=2026-08-2*/*.parquet")         # glob 收窄到新增分区
    .filter(pl.col("level") == "ERROR")
    .with_columns(hour=pl.col("ts").dt.truncate("1h"))
    .group_by(["hour", "endpoint"]).agg(pl.len().alias("n"))
@@ -123,7 +137,7 @@ duckdb.sql("""
 ## 性能检查清单
 
 - [ ] 峰值内存是否稳定在预期上界？（用 `/usr/bin/time -l` 实测）
-- [ ] STREAMING 标记验证？
+- [ ] 实测峰值内存验证流式效果？（1.41+ 新引擎 `explain` 无 STREAMING 标记，见第 8 章）
 - [ ] 聚合基数（小时 × 端点）是否预估过？
 - [ ] 增量运行是否幂等（anti join 保障）？
 

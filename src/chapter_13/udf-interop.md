@@ -11,7 +11,7 @@
 import polars as pl
 import time
 
-big = pl.DataFrame({"x": pl.int_range(0, 1_000_000, dtype=pl.Float64)})
+big = pl.select(x=pl.int_range(0, 1_000_000, dtype=pl.Int64).cast(pl.Float64))
 
 # 原生表达式：Rust 内核，向量化
 t0 = time.perf_counter()
@@ -54,12 +54,13 @@ name = "polars_udt"
 crate-type = ["cdylib"]
 
 [dependencies]
-polars = { version = "0.4x" }
-pyo3 = { version = "0.2x", features = ["extension-module"] }
+# 版本以 polars crate 与 pyo3 当时的稳定版为准，二者需与 Python 侧 polars 版本匹配
+polars = { version = "*" }
+pyo3 = { version = "*", features = ["extension-module"] }
 ```
 
 ```rust
-// src/lib.rs —— 一个/plugin 的最小实现
+// src/lib.rs —— 一个表达式 plugin 的最小实现
 use polars::prelude::*;
 
 #[polars_expr(output_type=Int64)]
@@ -76,10 +77,11 @@ fn my_gcd(inputs: &[Series]) -> PolarsResult<Series> {
 
 ```python
 # Python 侧注册并使用——像原生表达式一样参与优化
-from polars import register_plugin_function
+from polars.plugins import register_plugin_function
 
 df.with_columns(
     register_plugin_function(
+        # Linux 为 .so；macOS 为 .dylib、Windows 为 .dll
         plugin_path="target/release/libpolars_udt.so",
         function_name="my_gcd",
         args=[pl.col("a"), pl.col("b")],
@@ -98,12 +100,12 @@ flowchart TB
     P --"to_arrow / from_arrow（零拷贝）"--> A
     P --"to_numpy / from_numpy（无 null 时零拷贝）"--> N
     P --"duckdb.sql 直接查询"--> D
-    D --"df() 返回 Polars"--> P
+    D --".pl() 返回 Polars（.df() 返回 pandas）"--> P
 ```
 
 - 与 NumPy：无 null 列零拷贝
 - 与 Arrow：`to_arrow` / `from_arrow`
-- 与 DuckDB：SQL 查询 Polars DataFrame，结果直接返回 Polars
+- 与 DuckDB：SQL 查询 Polars DataFrame，`.pl()` 直接返回 Polars
 
 ```python
 # NumPy 互通：把成熟的科学计算库接到管道里
@@ -127,7 +129,7 @@ lf = pl.scan_parquet("events.parquet")
 
 # DuckDB 直接查询 Polars 的 LazyFrame（1.x 支持）
 rel = duckdb.sql("SELECT region, AVG(amount) FROM lf GROUP BY region")
-stats = rel.df()               # 返回物化结果
+stats = rel.pl()               # .pl() 返回 Polars DataFrame（.df() 返回 pandas）
 # 或 pl.from_arrow(rel.arrow()) 零拷贝转回
 
 # 分工模式：Polars 做重变换（清洗/聚合），DuckDB 做探索式 SQL
@@ -140,6 +142,8 @@ stats = rel.df()               # 返回物化结果
 
 ```python
 # from_pandas：Arrow 化需要一次完整转换
+import pandas as pd
+
 pdf = pd.DataFrame({"a": [1, 2, 3]})
 df = pl.from_pandas(pdf)
 

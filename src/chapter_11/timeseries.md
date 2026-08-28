@@ -12,10 +12,11 @@ import polars as pl
 from datetime import datetime
 
 df = pl.DataFrame({
-    "ts": pl.datetime_range(
+    "symbol": ["AAPL"] * 11 + ["MSFT"] * 11,   # 两个标的，各 11 个分钟点
+    "ts": list(pl.datetime_range(
         datetime(2026, 8, 1), datetime(2026, 8, 1, 0, 10), "1m", eager=True
-    ),
-    "value": [1.0, 2.0, None, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+    )) * 2,
+    "value": [1.0, 2.0, None, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0] * 2,
 })
 
 # 底层：Date 是天数偏移，Datetime 是时间戳整数
@@ -61,7 +62,7 @@ pl.select(
 
 # 时间窗口（而非固定行数）：rolling_*_by 系列按另一列的值定义窗口
 df.with_columns(
-    pl.col("value").rolling_sum_by("ts", window_size="3m").alias("sum_3m")
+    pl.col("value").rolling_sum_by("ts", window_size="3m").over("symbol").alias("sum_3m")
 )
 ```
 
@@ -75,9 +76,9 @@ flowchart LR
 ```
 
 ```python
-# group_by_dynamic：窗口对齐聚合——分钟 → 小时 OHLC
+# group_by_dynamic：窗口对齐聚合——分钟 → 小时 OHLC（group_by 按标的分区）
 (df.sort("ts")
-   .group_by_dynamic("ts", every="1h", closed="left")
+   .group_by_dynamic("ts", every="1h", closed="left", group_by="symbol")
    .agg(
        open=pl.col("value").first(),
        high=pl.col("value").max(),
@@ -86,8 +87,8 @@ flowchart LR
    ))
 
 # upsample：补齐缺失时间点（行数可能膨胀）
-df.upsample("ts", every="1m").with_columns(
-    pl.col("value").forward_fill()   # 通常紧跟填充
+df.upsample("ts", every="1m", group_by="symbol").with_columns(
+    pl.col("value").forward_fill().over("symbol"),   # 组内前值填充
 )
 ```
 
@@ -130,17 +131,26 @@ monthly.with_columns(
 ```python
 # 陷阱：缺失周期会让环比错位——1 月和 3 月比，跳过了 2 月
 sparse = pl.DataFrame({
-    "month": ["2026-01", "2026-03"],   # 缺 2 月
+    "month": ["2026-01", "2026-03"],   # 2 月数据缺失
     "total": [100, 130],
 })
-sparse.with_columns(pl.col("total").pct_change(1))  # 30%——但它不是环比！
+sparse.with_columns(pl.col("total").pct_change(1))
+# 得 0.3——一个"看似正常"的 30% 环比，实际是跨了两个月的错位比较：
+# 它把 1→3 月的总涨幅记在了一个月头上，掩盖了真实走势
 
-# 对策：先补齐再计算
-dense = sparse.with_columns(pl.col("month").str.to_date("%Y-%m"))
-dense = dense.upsample("month", every="1mo").with_columns(
-    pl.col("total").forward_fill()
-)
-dense.with_columns(pl.col("total").pct_change(1))  # 正确的逐月环比
+# 假如 2 月的真实值是 115（从源表找回），补齐后环比完全不同
+dense = pl.DataFrame({
+    "month": ["2026-01", "2026-02", "2026-03"],
+    "total": [100, 115, 130],
+})
+dense.with_columns(pl.col("total").pct_change(1))
+# 2 月 0.15、3 月 0.13——涨势平缓得多，0.3 是缺月制造的错觉
+
+# 对策：周期补齐后再计算（拿不到真实值时用 forward_fill 近似）
+filled = (sparse.with_columns(pl.col("month").str.to_date("%Y-%m"))
+                .upsample("month", every="1mo")
+                .with_columns(pl.col("total").forward_fill()))
+filled.with_columns(pl.col("total").pct_change(1))
 ```
 
 ## 要点回顾

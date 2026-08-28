@@ -26,13 +26,14 @@ sequenceDiagram
 
 ```python
 import polars as pl
-print(pl.thread_pool_size())   # 例如 10 —— 默认等于物理核数
+print(pl.thread_pool_size())   # 例如 10 —— 默认取 OS 可用并行度（通常是逻辑核数）
 
 # 感受并行度带来的收益：1 亿行聚合
 import time
 
 N = 100_000_000
-df = pl.DataFrame({"x": pl.int_range(0, N, dtype=pl.Float64)})
+# int_range 只接受整数 dtype，转 Float64 需要显式 cast
+df = pl.select(x=pl.int_range(0, N, dtype=pl.Int64).cast(pl.Float64))
 
 t0 = time.perf_counter()
 df.select(pl.col("x").sum())
@@ -112,7 +113,7 @@ with ProcessPoolExecutor(8) as ex:
 # 要么手动限制每进程线程数：POLARS_MAX_THREADS=2 + 5 进程
 ```
 
-## 7.5 GPU 引擎（可选）
+## 7.6 GPU 引擎（可选）
 
 Polars 支持将查询下推到 NVIDIA GPU 执行（`engine="gpu"`，需额外安装 `polars[gpu]` 且依赖 CUDA 环境）：
 

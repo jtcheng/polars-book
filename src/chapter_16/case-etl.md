@@ -20,16 +20,48 @@ flowchart LR
 ## 16.2 增量 ETL
 
 ```python
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 import polars as pl
 
 # CDC 导出：每批次一个 CSV，含操作类型
-# cdc/orders_2026-08-27.csv
+# cdc/orders_2026-08-26.csv、cdc/orders_2026-08-27.csv
 # 列：op (I/U/D), order_id, user_id, amount, ts
+
+# 先运行一次数据生成（2 天 × 50 笔订单），本章代码即可顺序执行：
+import numpy as np
+
+rng = np.random.default_rng(7)
+for day in [date(2026, 8, 26), date(2026, 8, 27)]:
+    n = 50
+    pl.DataFrame({
+        "op": rng.choice(["I", "I", "I", "U"], n),
+        "order_id": np.arange(day.day * 1000, day.day * 1000 + n),
+        "user_id": rng.integers(1, 20, n),
+        "amount": np.round(rng.uniform(10, 500, n), 2),
+        "ts": [datetime(day.year, day.month, day.day, 10)
+               + timedelta(minutes=int(i)) for i in rng.integers(0, 480, n)],
+    }).write_csv(f"cdc/orders_{day.isoformat()}.csv")
 
 def ingest_day(day: date) -> None:
     """单日增量：清洗 → 去重 → 分区写出（幂等）"""
     partition = f"lake/orders/date={day.isoformat()}"
+    Path(partition).mkdir(parents=True, exist_ok=True)
+
+    # 空湖兜底：glob 无文件时 scan_parquet 会报
+    # ComputeError: expanded paths were empty —— 首次运行先全量 sink 初始快照
+    if not list(Path("lake/orders").glob("date=*/**/*.parquet")):
+        (pl.scan_csv(f"cdc/orders_{day.isoformat()}.csv",
+                     schema_overrides={"order_id": pl.Int64, "amount": pl.Float64})
+           .with_columns(
+               pl.col("amount").cast(pl.Float64),
+               pl.col("user_id").cast(pl.Int64, strict=False),
+           )
+           .filter(pl.col("amount") > 0)
+           .sort("ts")
+           .unique(subset=["order_id"], keep="last")
+           .sink_parquet(f"{partition}/part-0.parquet"))
+        return
 
     (pl.scan_csv(f"cdc/orders_{day.isoformat()}.csv",
                  schema_overrides={"order_id": pl.Int64, "amount": pl.Float64})
@@ -47,7 +79,11 @@ def ingest_day(day: date) -> None:
            pl.scan_parquet("lake/orders/**/*.parquet").select("order_id"),
            on="order_id", how="anti",
        )
-       .sink_parquet(f"{partition}/part-0.parquet"))
+       .sink_parquet(f"{partition}/part-1.parquet"))
+
+# 逐日入湖：第一天走空湖兜底，第二天走正常增量路径
+ingest_day(date(2026, 8, 26))
+ingest_day(date(2026, 8, 27))
 ```
 
 ### 水位线（watermark）管理
@@ -86,13 +122,14 @@ duckdb.sql("""
 result = duckdb.sql("""
     WITH daily AS (
         SELECT date, SUM(amount) AS total
-        FROM 'lake/orders/**/*.parquet' GROUP BY date
+        FROM 'lake/orders/**/*.parquet' GROUP BY date ORDER BY date
     )
-    SELECT * FROM daily WHERE total > 1000000
+    SELECT * FROM daily WHERE total > 5000 ORDER BY date
 """).arrow()
 pl.from_arrow(result).with_columns(
     mom=pl.col("total").pct_change(1)   # 回到 Polars 算环比
 )
+# 两层 ORDER BY 保证行序稳定——pct_change 依赖行序，乱序会让环比悄悄错位
 ```
 
 ## 16.4 派生表：用户画像
@@ -140,6 +177,7 @@ pl.scan_parquet("lake/orders/**/*.parquet").select("order_id")
 # 读取时元数据解析开销累积 → 定期合并（compaction）
 
 from datetime import date, timedelta
+import shutil
 
 def compact_month(lake_root: str, month_start: date) -> None:
     month_end = month_start + timedelta(days=30)
@@ -148,9 +186,25 @@ def compact_month(lake_root: str, month_start: date) -> None:
                    if month_start <= date.fromisoformat(p.name.split("=")[1]) < month_end]
     if len(month_parts) <= 1:
         return
+    # 第 1 步：合并结果先写入 tmp 目录——不动线上数据
+    tmp = Path(lake_root, "_compact")
+    tmp.mkdir(exist_ok=True)
+    merged = tmp / f"orders_{month_start.isoformat()}.parquet"
     (pl.scan_parquet([f"{p}/*.parquet" for p in month_parts])
-       .sink_parquet(f"lake/_compact/orders_{month_start.isoformat()}.parquet"))
-    # 原子替换：mv 旧目录 → tmp，写入新分区，成功后删除 tmp
+       .sink_parquet(merged))
+    # 第 2 步：校验行数一致，防止合并丢数据
+    n_old = sum(pl.scan_parquet(f"{p}/*.parquet").select(pl.len()).collect().item()
+                for p in month_parts)
+    assert pl.scan_parquet(merged).select(pl.len()).collect().item() == n_old
+    # 第 3 步：mv（同盘原子）新分区就位 → 清理旧目录与 tmp
+    new_part = Path(lake_root, "orders", f"date={month_start.isoformat()}_m")
+    new_part.mkdir()
+    merged.rename(new_part / "part-0.parquet")
+    for p in month_parts:
+        shutil.rmtree(p)
+    tmp.rmdir()
+
+compact_month("lake", date(2026, 8, 26))
 ```
 
 ## 要点回顾

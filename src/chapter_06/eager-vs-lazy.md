@@ -50,9 +50,10 @@ result = lf3.collect()                        # 此刻才读取+优化+执行
    .select(["a", "b"])
    .explain())
 # 典型输出：
-# Pdf SCAN [data.parquet]
+# Parquet SCAN [data.parquet]
 # PROJECT 2/5 COLUMNS      ← 投影裁剪：5 列只读 2 列
-# SELECTION: [(col("a")) > (5)]   ← 谓词下推：过滤发生在扫描层
+# SELECTION: col("a") > 5  ← 谓词下推：过滤发生在扫描层
+# ESTIMATED ROWS: 1000
 ```
 
 - 学会看 `SELECTION`、`PROJECT` 节点
@@ -65,14 +66,23 @@ result = lf3.collect()                        # 此刻才读取+优化+执行
 - 优化开关：`optimizations=pl.QueryOptFlags(...)`
 
 ```python
-# 观察 filter 下推如何跨 join 移动
+# 观察 filter 下推如何跨 join 移动：大表 join 小表
 orders = pl.scan_parquet("orders.parquet")     # 大表
 users = pl.scan_parquet("users.parquet")       # 小表
 
-(pl.LazyFrame({"k": [1]})
-   .join(orders, on="k")
-   .filter(pl.col("amount") > 100))
-# 优化器可能把 filter 下推到 orders 扫描层，甚至调整 join 顺序
+print((orders
+   .join(users, on="k")
+   .filter(pl.col("amount") > 100)
+   .explain()))
+# 典型输出：
+# INNER JOIN:
+#   LEFT PLAN ON: [col("k")]
+#     Parquet SCAN [orders.parquet]
+#     PROJECT */2 COLUMNS
+#     SELECTION: col("amount") > 100   ← filter 已下推到 orders 扫描层
+#   RIGHT PLAN ON: [col("k")]
+#     Parquet SCAN [users.parquet]
+# END INNER JOIN
 ```
 
 ```python
@@ -105,5 +115,5 @@ print(lf.explain(optimizations=pl.QueryOptFlags.none()))  # 原始计划
 ## 练习
 
 1. **计划对比**：构造 `scan → join → filter → select` 的链，分别用默认优化与 `QueryOptFlags.none()` 打印计划，圈出被下推/重排的节点。
-2. **物化计数**：把 6.1 节的 Eager 三步操作换成 `profile()`，统计中间物化的总行数；再用 Lazy 版本跑一次，对比两者处理的总行数差异。
+2. **物化计数**：把 6.1 节的 Eager 三步操作改为给每步中间结果记录 `estimated_size()` 与行数，统计中间物化的总量；再用 Lazy 版本跑一次，对比两者处理的总量差异。
 3. **思考题**：什么情况下 Eager 反而比 Lazy 快？（提示：数据已在内存且反复交互查看中间结果时，优化本身的成本）

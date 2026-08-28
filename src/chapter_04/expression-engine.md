@@ -48,6 +48,8 @@ print(df.select(
 - 缓存行一次装载 8 个 Float64
 
 ```python
+import time
+
 import numpy as np
 import polars as pl
 
@@ -55,12 +57,21 @@ N = 50_000_000
 a_np = np.random.rand(N)
 b_np = np.random.rand(N)
 
-# NumPy：向量化但单线程（受限于 BLAS 配置）
-%timeit a_np + b_np
+def bench(fn, repeat=5):
+    fn()                       # 预热
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        fn()
+    return (time.perf_counter() - t0) / repeat
+
+# NumPy：元素级运算不经过 BLAS 且默认单线程
+t_np = bench(lambda: a_np + b_np)
 
 # Polars：向量化 + 多线程分区
 sa, sb = pl.Series(a_np), pl.Series(b_np)
-%timeit sa + sb    # 典型结果：快 2~4 倍（取决于核数）
+t_pl = bench(lambda: sa + sb)
+print(f"NumPy {t_np * 1e3:.1f} ms vs Polars {t_pl * 1e3:.1f} ms")
+# 典型结果：Polars 快 1~4 倍（取决于核数）
 ```
 
 ### 表达式在上下文中求值
@@ -76,6 +87,8 @@ df.select(pl.col("amount").sum())           # 全局聚合 → 750
 df.with_columns(pl.col("amount").sum().alias("total"))  # 广播 → 每行 750
 df.group_by("user").agg(pl.col("amount").sum())  # 分组聚合
 ```
+
+元素级表达式的独立可组合——每一行的结果只依赖同一行的输入——正是流式引擎逐块执行的基础（第 8 章）。
 
 ## 4.3 为什么不经过 Python 解释器
 
@@ -96,7 +109,7 @@ df.with_columns((pl.col("amount") * 1.13).alias("taxed"))
 ```python
 # 亲眼见证差距：100 万行
 import time
-big = pl.DataFrame({"x": pl.int_range(0, 1_000_000, dtype=pl.Float64)})
+big = pl.select(x=pl.int_range(0, 1_000_000, dtype=pl.Int64).cast(pl.Float64))
 
 t0 = time.perf_counter()
 big.select(pl.col("x") * 2)

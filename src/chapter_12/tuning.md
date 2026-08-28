@@ -105,11 +105,12 @@ print(statistics.median(times))
 # 起点：一段"莫名慢"的管道
 def slow_pipeline():
     df = pl.read_csv("events.csv")                       # ① read 而非 scan
-    df = df.filter(df["status"] == "OK")                 # ② pandas 风格写法
+    df = df.filter(df["status"] == "OK")                 # ② 该写法能运行，但每次比较
+    #                                                       都会物化布尔 Series，无法下推优化
     df = df.with_columns(
         bonus=df["amount"].map_elements(lambda x: x * 0.1)  # ③ UDF
     )
-    return df.group_by("region").agg(df["bonus"].sum().alias("total"))
+    return df.group_by("region").agg(pl.col("bonus").sum().alias("total"))
 
 # 调优后：scan + 表达式 + 一次执行
 def fast_pipeline():

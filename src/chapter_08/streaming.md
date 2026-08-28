@@ -45,7 +45,8 @@ df.write_parquet("out.parquet")
 
 ## 8.2 new streaming engine
 
-- 旧流式引擎 vs `collect(engine="streaming")`
+- 新流式引擎（1.41+ 进入 stable）取代了旧流式引擎：旧引擎只让部分节点流式、靠 `explain` 的 STREAMING 标记识别；新引擎整条管道默认以 morsel 为单元流式执行
+- `collect(engine="streaming")` 显式选用新引擎（默认 `engine="auto"`，2.0 起流式将成为默认引擎）
 - morsel 机制：分块读取 → 分块处理 → 分块写出
 - 峰值内存控制原理
 
@@ -76,25 +77,49 @@ sink_lf.collect()   # 此刻才真正执行；返回空 DataFrame，数据已在
 
 ```mermaid
 flowchart TD
-    OP{"操作类型"} -->|"filter / select / with_columns<br/>（逐行无状态）"| YES["可流式<br/>天然逐块处理"]
-    OP -->|"group_by.agg<br/>（有限基数）"| YES2["可流式<br/>增量哈希聚合"]
-    OP -->|"sort / unique<br/>（全序依赖）"| PART["部分流式<br/>需回退或分块归并"]
-    OP -->|"跨块全局窗口<br/>join 大表"| NO["会断流<br/>检查 explain 输出"]
+    OP{"操作类型"} -->|"filter / select / with_columns<br/>（逐行无状态）"| YES["天然流式<br/>逐 morsel 处理"]
+    OP -->|"group_by.agg<br/>（有限基数）"| YES2["流式<br/>增量哈希聚合"]
+    OP -->|"sort / unique<br/>（全序依赖）"| OOC["流式（out-of-core）<br/>1.42+ 内存不足时溢写磁盘<br/>内存充足时退回全内存更快"]
+    OP -->|"join 大表"| OOC2["流式（out-of-core）<br/>1.42+ 同上"]
 ```
 
-- 检查方法：`explain(streaming=True)` 中查看 STREAMING 节点
+新引擎下 sort/join 支持 out-of-core：内存不足时把中间数据溢写磁盘、逐块归并，代价是 I/O；内存充足时仍走全内存路径，速度更快。仍有少数复杂算子（如某些跨块全局窗口）可能退回全内存执行，以实测为准。
+
+### 验证手段：实测峰值内存
+
+旧验证方法 `explain(streaming=True)` 已于 1.25 弃用，且 1.41+ 新流式引擎的 `explain` 输出**不再包含 STREAMING 节点标记**——整条管道默认就在流式，计划文本看不出差别。可靠的验证手段是实测峰值 RSS：管道真的在流式，峰值内存就不随数据量线性增长。
 
 ```python
-lf = (
-    pl.scan_parquet("logs/*.parquet")
-      .filter(pl.col("level") == "ERROR")
-      .with_columns(hour=pl.col("ts").dt.truncate("1h"))
-      .group_by("hour").agg(pl.len())
-)
-print(lf.explain(streaming=True))
-# 计划中出现 STREAMING 节点 → 该段管道将流式执行
-# 若某操作导致 STREAMING 中断，说明该处需要全量数据
+# 用子进程跑管道，resource 读取峰值 RSS（跨平台，无需外部工具）
+import subprocess
+import sys
+import resource
+
+CHILD = """
+import polars as pl
+(pl.scan_parquet("logs/*.parquet")
+   .filter(pl.col("level") == "ERROR")
+   .with_columns(hour=pl.col("ts").dt.truncate("1h"))
+   .group_by("hour")
+   .agg(pl.len().alias("n"))
+   .sink_parquet("error_stats.parquet"))
+"""
+
+proc = subprocess.run([sys.executable, "-c", CHILD])
+assert proc.returncode == 0
+peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+if sys.platform == "linux":       # macOS 返回字节，Linux 返回千字节
+    peak *= 1024
+print(f"峰值 RSS ≈ {peak / 1024 / 1024:.0f} MB")
 ```
+
+```bash
+# 命令行一行搞定
+/usr/bin/time -l python pipeline.py   # macOS：看 "peak memory footprint"
+/usr/bin/time -v python pipeline.py   # Linux：看 "Maximum resident set size"
+```
+
+把输入规模放大 5 倍再跑一次：峰值 RSS 几乎不变 → 内存复杂度 O(基数) 而非 O(数据量)，这就是流式执行的直接证据。
 
 ## 8.4 与 batch 处理结合
 
@@ -136,19 +161,19 @@ lf.group_by("user_id").agg(pl.len())
 ## 要点回顾
 
 - scan → 变换 → sink 全程内存 O(分块) 而非 O(全量)
-- 用 explain(streaming=True) 验证管道真的在流式
+- 新流式引擎（1.41+）整条管道默认以 morsel 为单元流式执行；验证靠实测峰值 RSS，而非旧的 STREAMING 标记
 - 聚合基数是流式可行性的决定因素
 
 ## 性能检查清单
 
 - [ ] 是否用 sink_* 替代了 collect 后再 to_parquet？
 - [ ] group_by 的基数（unique key 数）是否可控？
-- [ ] 是否验证过 STREAMING 标记存在？
-- [ ] 不可流式的操作是否用分区批处理降级？
-- [ ] 峰值内存是否实测过（time -l / 资源监视器）？
+- [ ] 是否实测过峰值 RSS，确认内存不随数据量线性增长？
+- [ ] sort/join 大表是否留意过 out-of-core 路径的内存/速度取舍？
+- [ ] 峰值内存是否实测过（time -l / subprocess + resource）？
 
 ## 练习
 
-1. **断流定位**：构造 `scan → with_columns(UDF) → group_by → sink` 的管道，用 `explain(streaming=True)` 找出 STREAMING 标记在哪一步消失；把 UDF 移到 filter 之后，再看标记是否恢复。
-2. **内存实测**：生成 5GB 分区 Parquet（可用循环 sink），分别以 collect 和 sink 两种方式聚合，用 `/usr/bin/time -l`（Linux）或活动监视器记录峰值 RSS 差异。
+1. **规模不变性**：对同一条 sink 聚合管道，分别输入 1GB 与 5GB 数据（可循环 sink 生成），用 `subprocess` + `resource.getrusage` 记录两次峰值 RSS。若两者接近，就证明了内存复杂度 O(基数) 而非 O(数据量)——这是新流式引擎（1.41+）替代旧 STREAMING 标记的验证方法。
+2. **内存实测**：生成 5GB 分区 Parquet（可用循环 sink），分别以 collect 和 sink 两种方式聚合，用 `/usr/bin/time -l`（macOS）或 `/usr/bin/time -v`（Linux）记录峰值 RSS 差异。
 3. **基数实验**：对同一份大数据分别按低基列（如 weekday）与高基列（如 user_id）流式聚合，观察内存曲线差异，验证"基数决定一切"。

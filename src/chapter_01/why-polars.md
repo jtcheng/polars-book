@@ -24,10 +24,11 @@ print(pl.thread_pool_size())    # 查看可用并行度，例如 10
 # 生成 1000 万行示例数据，观察多线程聚合的耗时
 import time
 
-df = pl.DataFrame({
-    "user": pl.int_range(0, 10_000_000, dtype=pl.Int64) % 1_000,
-    "amount": pl.int_range(0, 10_000_000, dtype=pl.Int64) % 10_000,
-})
+# 注意：pl.DataFrame 不接受 Expr，用 pl.select 求值表达式生成列
+df = pl.select(
+    user=pl.int_range(0, 10_000_000, dtype=pl.Int64) % 1_000,
+    amount=pl.int_range(0, 10_000_000, dtype=pl.Int64) % 10_000,
+)
 
 t0 = time.perf_counter()
 result = df.group_by("user").agg(pl.col("amount").sum())
@@ -101,9 +102,11 @@ import time
 import polars as pl
 
 N = 100_000_000
+# pl.select 求值表达式生成列，再转 LazyFrame
 lf = (
-    pl.LazyFrame({"k": pl.int_range(0, N) % 1_000,
-                  "x": pl.int_range(0, N) % 1_000_000})
+    pl.select(k=pl.int_range(0, N, dtype=pl.Int64) % 1_000,
+              x=pl.int_range(0, N, dtype=pl.Int64) % 1_000_000)
+    .lazy()
 )
 
 t0 = time.perf_counter()
@@ -127,7 +130,7 @@ print(f"1 亿行 group_by: {time.perf_counter() - t0:.2f}s")
 在选型或动手优化前，先回答这些问题：
 
 - [ ] 我的数据规模单机内存（含磁盘交换）能否容纳？——数 GB 到数百 GB 是 Polars 甜蜜区
-- [ ] 瓶颈是计算还是 I/O？——`profile()` 先定位，不靠猜（第 12 章）
+- [ ] 瓶颈是计算还是 I/O？——`explain()` 先看计划，不靠猜（第 6、12 章）
 - [ ] 是否需要分布式？——只在单机内存/磁盘真正不够时才考虑 Spark 等方案
 - [ ] 现有管道是否已有明显反模式？——逐行循环、CSV 主存储、无谓的中间物化
 - [ ] 是否在容器/cgroup 中运行？——确认 `POLARS_MAX_THREADS` 与实际配额一致（第 7 章）

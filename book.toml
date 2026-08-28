@@ -9,8 +9,8 @@ command = "mdbook-mermaid"
 renderer = ["html"]
 
 [output.html]
-git-repository-url = "https://github.com/example/polars-book"
-edit-url-template = "https://github.com/example/polars-book/edit/main/{path}"
+git-repository-url = "https://github.com/jtcheng/polars-book"
+edit-url-template = "https://github.com/jtcheng/polars-book/edit/main/{path}"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [output.html.search]

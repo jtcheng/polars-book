@@ -4,12 +4,12 @@
 
 ## 11.1 日期底层表示
 
-- `Date` = i32（自纪元天数）、`Datetime` = i64（时间戳）
-- 时区处理：`dt.convert_time_zone`
+- `Date` = i32（自纪元天数）、`Datetime` = i64（时间戳，默认微秒精度）
+- 时区处理：`dt.replace_time_zone` 挂时区标签、`dt.convert_time_zone` 换算显示
 
 ```python
 import polars as pl
-from datetime import datetime
+from datetime import datetime, date
 
 df = pl.DataFrame({
     "symbol": ["AAPL"] * 11 + ["MSFT"] * 11,   # 两个标的，各 11 个分钟点
@@ -22,6 +22,15 @@ df = pl.DataFrame({
 # 底层：Date 是天数偏移，Datetime 是时间戳整数
 print(df.get_column("ts").to_physical().head(2))
 # 物理表示均为整数——比较/排序/截断都是整数运算
+# 实测输出（polars 1.44.1）：
+# Series: 'ts' [i64]
+# [1785542400000000, 1785542460000000]
+#   ↑ 2026-08-01 00:00:00 / 00:01:00 的微秒时间戳（i64）
+
+# Date 列的物理表示则是 i32 天数：
+print(pl.DataFrame({"d": [date(2026, 8, 29)]}).get_column("d").to_physical())
+# Series: 'd' [i32]
+# [20694]   ← 自 1970-01-01 起的第 20694 天
 
 # dt 命名空间：零成本拆解时间维度
 df.with_columns(
@@ -46,6 +55,37 @@ pl.select(
 )
 ```
 
+**为什么整数表示值得关心**：`ts > 某时刻` 是一次整数比较，`sort("ts")` 是整数数组排序，`dt.truncate("1h")` 是把微秒数对齐到 3 600 000 000 的整数倍——全程不碰日历库，SIMD 直接在连续整数数组上工作。本章后面会反复回到这条分界线：凡是只涉及"时刻"的操作（比较、排序、去重、join 键）都享受整数速度；凡是涉及"本地钟面"的操作（年/月/日/时拆解、时区截断）都要做日历换算，代价完全不同。
+
+**replace_time_zone 与 convert_time_zone**：`replace_time_zone(tz)` 是"重新解释"——时钟读数不变，给这个读数挂上时区标签，绝对时刻随之改变；`convert_time_zone(tz)` 是"换算显示"——绝对时刻不变，把钟面换算到目标时区。实测对比：
+
+```python
+utc = pl.DataFrame({"ts": [datetime(2026, 8, 1, 0, 0)]}).with_columns(
+    pl.col("ts").dt.replace_time_zone("UTC")
+)
+# 2026-08-01 00:00:00 UTC，物理整数 1785542400000000
+
+# replace：时钟读数 00:00 不变，物理整数被改写（-8h）——"这是上海时间 00:00"
+utc.with_columns(pl.col("ts").dt.replace_time_zone("Asia/Shanghai"))
+# 2026-08-01 00:00:00 CST，物理整数 1785513600000000
+
+# convert：物理整数不变（绝对时刻没动），钟面换算——"同一时刻在上海是几点"
+utc.with_columns(pl.col("ts").dt.convert_time_zone("Asia/Shanghai"))
+# 2026-08-01 08:00:00 CST，物理整数 1785542400000000
+```
+
+一对反差记牢即可：**replace 改时刻、convert 改读数**。给无时区数据"补"时区用 `replace_time_zone("UTC")`；把已有时区数据换到用户时区展示用 `convert_time_zone`。
+
+**性能提示：管道内部尽量朴素 UTC，仅在展示层转换**。带时区的 `Datetime` 在逐字段拆解与截断时要考虑 DST 偏移，比朴素列贵得多——500 万行实测（polars 1.44.1，Apple M 系列，7 次取中位数）：
+
+| 操作 | 朴素 Datetime | 带时区（Asia/Shanghai） | 差距 |
+|---|---|---|---|
+| `dt.truncate("1h")` | ~4.9 ms | ~303 ms | ~62× |
+| `dt.hour()` | ~48.7 ms | ~110 ms | ~2.3× |
+| `sort("ts")` | ~13.7 ms | ~13.7 ms | 1.0× |
+
+排序毫无差别——它只比较物理整数，时区根本不参与；涉及"本地钟面"的操作则显著更贵（truncate 要做 DST 感知的边界换算）。实践模板：读入后统一为朴素 UTC，管道内全部按 UTC 计算，最后一步才 `convert_time_zone` 到用户时区。
+
 ## 11.2 rolling 的并行化
 
 - `rolling_mean` / `rolling_sum` 等的窗口机制
@@ -64,6 +104,74 @@ pl.select(
 df.with_columns(
     pl.col("value").rolling_sum_by("ts", window_size="3m").over("symbol").alias("sum_3m")
 )
+```
+
+### 窗口长度 vs 并行度：一次 500 万行实测
+
+直觉：窗口长度为 w 时，第 i 行的输出依赖前 w 行——窗口越长，行间依赖链越长，能安全并行切分的位置就越少，理应越慢。第 7 章练习 1 正是从"行间依赖"的角度让你验证这一点。实测（polars 1.44.1，Apple M 系列，5 次取中位数）：
+
+```python
+import time
+import statistics
+import polars as pl
+
+N = 5_000_000
+s = pl.DataFrame({"v": pl.int_range(0, N, eager=True, dtype=pl.Int64) * 3})
+
+def bench(window):
+    times = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        s.select(pl.col("v").rolling_mean(window))
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times)
+
+for w in [3, 100, 1000, 10_000]:
+    print(f"rolling_mean({w:>5}): {bench(w) * 1000:5.1f} ms")
+# 实测输出：
+# rolling_mean(    3):  51.8 ms
+# rolling_mean(  100):  52.0 ms
+# rolling_mean( 1000):  51.4 ms
+# rolling_mean(10000):  52.2 ms
+# （复测波动 ±4%，窗口之间的差异始终小于噪声）
+```
+
+窗口从 3 拉到 10000（三千多倍），耗时纹丝不动。原因是引擎优化：`rolling_mean(w)` 并不逐窗口重算，而是**增量维护滑动和**——窗口每右移一行，累加器"进一个元素、出一个元素"，每个输出行摊销 O(1)，窗口长度根本不进入时间复杂度。反证很直接：若按朴素的 O(n·w) 逐窗口求和，500 万行 × 10000 窗口 = 500 亿次元素操作，52 ms 内无论如何做不完——实测耗时本身就是复杂度为 O(n) 的证据。并行切分同理：线程按行块划分、每个块独立维护自己的增量状态，切分点数量与窗口长度无关。
+
+诚实结论：**"窗口越长越慢"的直觉在当前引擎（1.44.1）下不成立**，不必为缩短窗口做无谓的优化。直觉负责提出假设，实测负责裁决——这正是第 12 章方法论的核心。
+
+### rolling / rolling_*_by / group_by_dynamic 选型
+
+| 需求 | 工具 | 语义 | 对齐方式 | 典型场景 |
+|---|---|---|---|---|
+| 固定行数窗口 | `rolling_*` | "最近 N 行" | 按行号，每个输出恰好覆盖 N 个观测 | 均匀采样序列的技术指标（MA5、MA20） |
+| 时间边界窗口（逐行输出） | `rolling_*_by` | "过去 T 时间内的所有观测" | 按时间列的值，窗口内行数不固定 | 不规则间隔日志的"过去 5 分钟错误率" |
+| 变频聚合（每窗一行） | `group_by_dynamic` | "每个 T 周期聚合出一个值" | 按周期边界对齐，窗口互不重叠 | 分钟 → 小时 OHLC 重采样 |
+
+分水岭一句话：**rolling 数行、rolling_*_by 数时间、group_by_dynamic 切周期**。数据间隔均匀且无缺孔时，前两者的结果几乎一致；间隔一旦不规则，就必须想清楚要的是哪种语义。
+
+### rolling_*_by：按时间列定义窗口
+
+`rolling_sum_by("ts", "3m")` 与 `rolling_sum(3)` 的差异不止"按时间"三个字：固定行数窗口下，每个输出恰好聚合 3 个观测，与它们发生在多久之前无关，且开头 2 行因窗口不满输出 null；时间窗口下，聚合的是"过去 3 分钟内"的观测——窗口里有多少行随间隔浮动，窗口不满时默认仍输出（`min_periods=1`）。不规则间隔下两者的分野一目了然：
+
+```python
+from datetime import datetime
+
+irr = pl.DataFrame({
+    "ts": [
+        datetime(2026, 8, 1, 0, 0),
+        datetime(2026, 8, 1, 0, 1),    # 间隔 1 分钟
+        datetime(2026, 8, 1, 0, 10),   # 间隔 9 分钟——跨过固定行数窗口，也滑出时间窗口
+        datetime(2026, 8, 1, 0, 11),
+    ],
+    "v": [10.0, 20.0, 30.0, 40.0],
+})
+irr.with_columns(
+    rows3=pl.col("v").rolling_sum(3),                            # [null, null, 60, 90]
+    time3m=pl.col("v").rolling_sum_by("ts", window_size="3m"),   # [10, 30, 30, 70]
+)
+# 00:10 那一行：rows3 = 10+20+30 = 60（最近 3 行——隔着 9 分钟也照算不误）
+#              time3m = 30（3 分钟窗内只剩自己——20 在 9 分钟前已被滑出）
 ```
 
 ## 11.3 重采样

@@ -42,6 +42,89 @@ print(df.select(
 # └──────────┴───────┘
 ```
 
+### 亲眼看两个计划：explain 的优化前后
+
+表达式树在 collect 时被翻译成逻辑计划，经过优化器改写后才生成物理计划。`explain` 能把两个版本都摊开——`pl.QueryOptFlags.none()` 关闭全部优化规则，得到忠实还原代码书写顺序的原始计划；默认 `explain` 给出改写后的版本：
+
+```python
+import polars as pl
+
+# 先造一张 12 列的表，让优化空间看得见
+N = 100_000
+cols = {"user_id": pl.int_range(0, N, dtype=pl.Int64) % 5_000}
+for j in range(11):
+    cols[f"col_{j:02d}"] = pl.int_range(0, N, dtype=pl.Int64) % 100
+pl.select(**cols).write_parquet("orders.parquet")
+
+q = (
+    pl.scan_parquet("orders.parquet")
+    .filter(pl.col("col_00") > 50)
+    .select(["user_id", "col_01"])
+)
+
+# 原始计划：FILTER 是 SCAN 之上的独立节点，要读全部 12 列
+print(q.explain(optimizations=pl.QueryOptFlags.none()))
+# SELECT [col("user_id"), col("col_01")]
+#   FILTER (col("col_00") > 50)
+#   FROM
+#     Parquet SCAN [orders.parquet]
+#     PROJECT */12 COLUMNS
+#     ESTIMATED ROWS: 100000
+
+# 优化后计划（默认 explain）：FILTER 节点消失了
+print(q.explain())
+# simple π 2/2 ["user_id", "col_01"]
+#   Parquet SCAN [orders.parquet]
+#   PROJECT 3/12 COLUMNS
+#   SELECTION: col("col_00") > 50
+#   ESTIMATED ROWS: 100000
+```
+
+同一段表达式代码，两个计划两种执行方式：原始计划里过滤发生在数据全部进入内存之后，且 12 列全读；优化后计划里谓词下推进 SCAN（`SELECTION`——第 3 章的行组跳过正是在这里生效），投影裁剪到 3 列：`user_id`、`col_01` 是结果需要的，`col_00` 是过滤本身需要的。优化器做的事，就是把"忠实翻译"改写成"最少工作量"。
+
+### 表达式的不可变性与复用
+
+表达式对象一旦构建就是**不可变的描述树**：它不属于任何 DataFrame，可以在任意多个上下文里重复使用而不被"消耗"，也不会被意外修改。循环外构建一次、循环内反复引用，是零成本的复用模式：
+
+```python
+taxed = pl.col("price") * 1.13          # 构建一次
+
+df_a = pl.DataFrame({"price": [100, 200]})
+df_b = pl.DataFrame({"price": [50, 60, 70]})
+print(df_a.select(taxed.alias("with_tax")))   # 同一个 taxed 对象
+print(df_b.select(taxed.alias("with_tax")))   # 用在两个上下文，互不影响
+
+# 循环外构建、循环内复用：每轮只是把同一棵树交给引擎
+frames = [pl.DataFrame({"price": [i, i * 2]}) for i in range(3)]
+total = 0.0
+for f in frames:
+    total += f.select(taxed.sum()).item()
+print(round(total, 2))   # 10.17
+```
+
+### Expr 是轻量句柄，但不是免费的
+
+Python 侧的 `Expr` 只是指向 Rust 侧表达式树节点的轻量句柄，创建成本以微秒计：
+
+```python
+import time
+
+t0 = time.perf_counter()
+for _ in range(100_000):
+    e = pl.col("price") * 1.13          # 每次循环都新建
+t_build = time.perf_counter() - t0
+
+taxed = pl.col("price") * 1.13          # 循环外建一次
+t0 = time.perf_counter()
+for _ in range(100_000):
+    e = taxed                           # 循环内只是引用
+t_reuse = time.perf_counter() - t0
+print(f"每次新建: {t_build:.3f}s vs 复用: {t_reuse:.3f}s")
+# 实测：每次新建 0.141s vs 复用 0.002s —— 单个约 1.4 µs
+```
+
+日常几十上百个表达式完全无感；但要警惕在十万次级的热循环里每次重建表达式——累计 0.14 s 的纯构建开销（对照 4.3 节：100 万行的整列乘法才约 1 ms）。表达式是"图纸"不是"工件"：画一次，到处用。
+
 ## 4.2 向量化与 SIMD
 
 - 逐元素循环 vs 整列批量指令

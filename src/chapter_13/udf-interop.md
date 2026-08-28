@@ -43,6 +43,14 @@ pl.col("x").map_elements(my_complex_fn)   # 自定义加密、调用外部库等
 - `polars_plugin` 机制：注册自定义命名空间函数
 - 开发流程：cargo 工程结构 → 编译 → Python 侧 `register_plugin_function`
 
+完整工程只需要两个文件，可以照着搭：
+
+```text
+polars_udt/
+├── Cargo.toml
+└── src/lib.rs
+```
+
 ```toml
 # Cargo.toml —— 表达式 plugin 工程骨架
 [package]
@@ -75,6 +83,33 @@ fn my_gcd(inputs: &[Series]) -> PolarsResult<Series> {
 }
 ```
 
+构建与注册三步：
+
+1. `cargo build --release` 编译出动态库，产物在 `target/release/` 下——macOS 为 `libpolars_udt.dylib`，Linux 为 `libpolars_udt.so`（Windows 为 `polars_udt.dll`）；
+2. Python 侧把动态库路径传给 `register_plugin_function`（也接受动态库所在目录）；
+3. 注册得到的是普通 `Expr`——可与原生表达式混用、进惰性管道，像内置函数一样参与优化。
+
+`register_plugin_function` 在 polars 1.44.1 的真实签名（`inspect.signature` 实测抄录，注释按官方文档字符串整理）：
+
+```python
+register_plugin_function(
+    *,
+    plugin_path,                      # 动态库路径：文件或其所在目录
+    function_name,                    # Rust 侧 #[polars_expr] 标注的函数名
+    args,                             # 传给 Rust 侧 inputs 的表达式参数
+    kwargs=None,                      # 非表达式参数，必须 JSON 可序列化
+    is_elementwise=False,             # 逐元素语义：可触发向量化/流式快速路径
+    changes_length=False,             # 输出长度会变（unique / slice 类）
+    returns_scalar=False,             # 聚合语义：作为最终聚合时自动展开单位长度
+    cast_to_supertype=False,          # 多输入先统一转换到公共超类型
+    input_wildcard_expansion=False,   # 执行前先展开通配符表达式
+    pass_name_to_apply=False,         # group_by 传入的 Series 附带列名（每组一次堆分配）
+    use_abs_path=False,               # 把路径解析为绝对路径
+)  # 返回 Expr
+```
+
+这些参数不是"配置项"，而是**你向引擎作出的承诺**——标错了不会报错，只会静默得到错误结果：比如把聚合函数标成 `is_elementwise=True`，流式与分组路径都会算错。
+
 ```python
 # Python 侧注册并使用——像原生表达式一样参与优化
 from polars.plugins import register_plugin_function
@@ -88,6 +123,14 @@ df.with_columns(
     ).alias("gcd")
 )
 ```
+
+**何时值得写 plugin**，三条判断：
+
+- **调用频次**：逻辑要对千万行逐行执行——13.1 实测 `map_elements` 比原生慢约 300 倍，这个倍数把 Python 写得再好也消不掉，只能换执行层；
+- **是否需要进优化器**：plugin 表达式与原生表达式一样参与谓词下推、并行分片与流式执行；`map_elements` 只能等收集完成后逐值调用，进不了任何优化；
+- **团队维护成本**：Rust 工具链、版本锁定、CI 冒烟测试都是持续成本——一次性脚本不值得，多人共用的核心库才值得。
+
+> **ABI 版本警示**：plugin 动态库与运行时 polars 直接共享内存布局，二者 ABI 必须严格匹配——Cargo 里 `polars` crate 的版本要与 Python 侧 `polars` 版本一致（性能清单最后一条正为此而设）。不匹配时通常不是抛 Python 异常，而是加载即 panic、甚至 undefined behavior（静默的内存错误），极难排查。对策：锁定版本并同步升级，CI 里加一个冒烟测试——加载 plugin、跑一个最小表达式、断言输出。
 
 ## 13.3 零拷贝生态互通
 
@@ -103,9 +146,11 @@ flowchart TB
     D --".pl() 返回 Polars（.df() 返回 pandas）"--> P
 ```
 
-- 与 NumPy：无 null 列零拷贝
-- 与 Arrow：`to_arrow` / `from_arrow`
-- 与 DuckDB：SQL 查询 Polars DataFrame，`.pl()` 直接返回 Polars
+**与 NumPy**：数值列无 null 时 `to_numpy()` 直接返回底层缓冲区的零拷贝视图（实测两次调用共享内存；视图只读，要可写就传 `writable=True`，代价是一次拷贝）。含 null 的列没有连续的物理表示，必须先物化——Float64 列的 null 会被转成 NaN 的普通数组，这次拷贝无法避免。
+
+**与 Arrow**：`to_arrow` / `from_arrow` 走标准 Arrow 数据接口，两侧缓冲区满足对齐、连续等布局要求时零拷贝共享；不满足时（如偏移数组不对齐、需要重排缓冲区）退化为一次整块 memcpy——仍是低成本拷贝，不是逐值转换。
+
+**与 DuckDB**：`duckdb.sql` 能直接查询 Polars 的 DataFrame 与 LazyFrame（替换扫描经 Arrow 接入，不必先落盘），查询结果用 `rel.pl()` 以 Polars DataFrame 返回、`.df()` 以 pandas 返回。实测（polars 1.44.1 + duckdb 1.5.5）：对 `pl.scan_parquet` 得到的 LazyFrame 直接 `SELECT region, AVG(amount) ... GROUP BY region` 正常执行。
 
 ```python
 # NumPy 互通：把成熟的科学计算库接到管道里
@@ -153,6 +198,18 @@ df = pl.from_pandas(pdf).select(...).to_pandas()
 # 2. 瓶颈段逐个替换为 Polars 管道
 # 3. 最终把 pandas 依赖压缩到系统边界
 ```
+
+**from_pandas 的成本**：数值列经 Arrow 缓冲区对接多为零拷贝——实测 100 万行 int64 列快到测不出来（转换后与 pandas 侧共享内存）；object 列没有列式表示，只能逐值装箱转换——实测 100 万行 object 字符串列约 28 ms，随行数线性增长。先在 pandas 侧把 object 列转成原生 dtype 再过边界，成本能低一个量级。
+
+**渐进式迁移三步法**（上面代码块注释里的三步展开）：
+
+**第 1 步 · 出入口保持 pandas，中间换 Polars**：上下游接口、同事的函数、报表工具都不动，只把计算内核替换成 `from_pandas(pdf).select(...).to_pandas()`。这一步改动最小、随时可回滚，先用它验证内核收益是否真实。
+
+**第 2 步 · 瓶颈段逐个替换**：用第 12 章的 profile 定位最慢的一段，改成 Polars 惰性管道（scan → 变换 → sink），其余照旧；每替换一段做一次回归对比，确认数值一致、耗时下降。
+
+**第 3 步 · 把 pandas 压到系统边界**：最终链路内部全程 Arrow 布局，只剩入口读与出口写两个转换点，边界转换近乎零成本。
+
+**边界策略**：一句话——"入口出口 pandas、内核 Polars"。pandas 留在系统边缘做兼容层（对接旧接口与外部工具），Polars 承担全部重计算；反过来（内核 pandas、边界 Polars）两头付转换税，零拷贝红利一点吃不到。
 
 ## 要点回顾
 

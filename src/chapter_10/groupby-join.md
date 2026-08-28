@@ -161,13 +161,45 @@ trades.join_asof(quotes, on="ts", strategy="backward")
 ```
 
 - 多键 join：`on=["k1", "k2"]`
-- join 顺序对小表构建哈希的影响
-- `join_where`（条件连接）
+
+**join 顺序：谁为小表建哈希**
+
+哈希 join 必须先把一侧物化成哈希表（内表），另一侧流式探测。上面速查表把 inner 简记为"右表建哈希"，但 1.x 引擎实际会估算两侧规模、自动选较小的一侧做内表——不必为性能刻意调整 join 方向。实测（polars 1.44.1，Apple M 系列，1000 万行大表 × 1 万行小表，int64 键随机打乱，3 次取最优）：大表在左 9.2 ms，小表在左 8.7 ms——两侧差异在噪声级，1.44 引擎两侧自适应。两个注脚：① 把小表显式放在 `join()` 右侧（作为参数传入的一方）仍是稳妥习惯——"右表是查找表"的语义清晰，也不依赖当前引擎的内表选择策略；② 基准 join 前先打乱键——两侧键都有序时会命中更快的专用路径（同样数据未打乱实测约 1 ms），测不出哈希 join 本身的行为。
+
+**join_where：非等值条件连接**
+
+适用场景是区间匹配、门槛筛选这类写不出等值键的连接——`on=` 只接受等值键，任意 (in)相等条件只能进 `join_where` 的谓词（多个谓词 AND，`how` 支持 inner/left/right）：
+
+```python
+# 非等值连接：给每笔订单找出所有门槛低于其金额的优惠券
+orders = pl.DataFrame({
+    "user_id": [1, 2, 3, 4],
+    "amount": [100, 200, 300, 400],
+})
+coupons = pl.DataFrame({
+    "coupon_id": ["c1", "c2"],
+    "threshold": [150, 350],
+})
+
+orders.join_where(coupons, pl.col("amount") > pl.col("threshold"))
+# ┌ user_id ┬ amount ┬ coupon_id ┬ threshold ┐   （4 行，行序不保证）
+# │ 4       ┆ 400    ┆ c2        ┆ 350       │
+# │ 4       ┆ 400    ┆ c1        ┆ 150       │
+# │ 3       ┆ 300    ┆ c1        ┆ 150       │
+# │ 2       ┆ 200    ┆ c1        ┆ 150       │
+# └─────────┴────────┴───────────┴───────────┘
+```
+
+代价提醒：没有等值键就没有可复用的哈希表，引擎按类似笛卡尔积的方式逐对求值谓词，复杂度 O(n·m)——两表各上万行就该警惕（它是性能清单里"误用 cross join"一条的近亲）。谓词中的列名默认解析到左表；两表重名时右表列带 `_right` 后缀。该 API 目前标记为实验性，输出行序不保证。
 
 ## 10.4 group_by 的多线程分区策略
 
 - 分区 → 局部聚合 → 归并
 - `maintain_order` 的代价
+
+执行时每个 Rayon 线程领到一段 morsel，先在本地做**局部哈希聚合**——各自维护一张"组键 → 部分聚合值"的小表，morsel 扫完就把局部结果并入全局（归并）。局部表的规模只取决于该线程见到的**基数**而非总行数，而 sum/mean/min/max 这类部分聚合值可以按任意批次切分、边扫边并——这正是第 8 章"聚合是流式友好操作"的根源。归并阶段各线程的局部表相互独立，谁先算完谁先并，天然可并行。
+
+`maintain_order=True` 的代价也正出在这里：它要求输出按组键全局有序，归并就不能"各自独立拼接"，而要按组键有序地全局合并——并行归并退化为有序合并，多出来的正是这部分全局排序协调成本。
 
 ```python
 # maintain_order=True 保证输出按组键有序
@@ -201,9 +233,48 @@ df.group_by("dept").agg(pl.col("salary").sum()).sort("dept")
    .group_by("city")
    .agg(pl.col("amount").sum())
    .sink_parquet("city_stats.parquet"))
-
-# 大表 join 大表：考虑按 join 键预分片，分批进行
 ```
+
+### 大表 join 大表：按 join 键预分片
+
+两侧都大到放不进内存建哈希时，把问题拆成 N 个"小 join"：写侧单次扫描，按 join 键的 `hash()` 取模分片落盘——同一键必然落入同一片（hash 在同一 polars 版本内确定，左右表哪怕分两次进程写也一致），两表用同一分片函数与片数，等值匹配就不会跨片；读侧逐片 load 做哈希 join + 局部聚合，内存上限从"整表"降到"单片"，结果逐片 sink 到独立文件。
+
+```python
+import os
+from glob import glob
+
+N = 16
+
+# 写侧：一次扫描，hash 取模分片落盘（PartitionBy 在 1.44 标记为 unstable）
+def shard_to(src: str, dst: str) -> None:
+    (pl.scan_parquet(src)
+       .with_columns(shard=pl.col("key").hash() % N)
+       .sink_parquet(pl.PartitionBy(dst, key="shard")))
+
+shard_to("big_left.parquet", "shards/left")
+shard_to("big_right.parquet", "shards/right")
+
+# 读侧：逐片哈希 join + 局部聚合，每片独立落盘
+for left_dir in sorted(glob("shards/left/shard=*")):
+    right_dir = left_dir.replace("/left/", "/right/")
+    if not os.path.isdir(right_dir):     # 空片不落盘：右表缺片 = 该片无匹配
+        continue
+    (pl.scan_parquet(f"{left_dir}/*.parquet")
+       .join(pl.scan_parquet(f"{right_dir}/*.parquet"), on="key", how="inner")
+       .group_by("dim")
+       .agg(pl.col("amount").sum())
+       .sink_parquet(f"out/{os.path.basename(left_dir)}.parquet"))
+```
+
+实测（polars 1.44.1）：`pl.col("key").hash()` 返回 UInt64（如 13223116160119632573），`% 16` 得片号，同键必同片；`PartitionBy` 落盘为 `shard=N/00000000.parquet` 的目录布局，空片不写文件——所以读侧按实际存在的片目录配对，而不是 `for i in range(N)`。若不想用 unstable 的 `PartitionBy`，写侧可退化为逐片 `filter(pl.col("key").hash() % N == i)`，代价是 N 次全表扫描。
+
+### 聚合基数决定流式可行性
+
+流式引擎解决的是"扫描不驻留内存"，不是"状态无限"：group_by 在流式下仍要维护一张"组键 → 聚合状态"的表，内存随基数增长（呼应性能清单第 3 条）。基数百万级、聚合状态是标量时通常无虞；若每组还要 `implode` 收集列表、或聚合状态本身很大，状态表同样会撑爆内存——先用 `approx_n_unique` 估基数，再决定流式还是预聚合落盘。
+
+### 小表广播还是分片哈希
+
+选择标准就一条：小表能否整表进内存建一次哈希。用 `df.estimated_size()` 估规模——约百 MB 量级以内直接整表物化/广播（本节开头 dim 表的 `.collect()` 即此），不必分片；到了 GB 级、或两侧同量级，才走分片路线。
 
 ## 要点回顾
 

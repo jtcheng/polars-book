@@ -132,6 +132,61 @@ print(s.to_numpy().__array_interface__["data"][0]
 - `String` 不是 Python str 对象的集合
 - `Categorical/Enum`：字典编码（第 9 章展开）
 
+### dtype 全景
+
+| 分组 | dtype | 一句话定位 |
+|---|---|---|
+| 整数 | `Int8/16/32/64`、`UInt8/16/32/64` | 严格固定宽度，溢出即报错，没有 Python int 的无限弹性 |
+| 浮点 | `Float32/Float64` | IEEE 754；null 与 NaN 是两套语义（见 2.2） |
+| 时间 | `Date`、`Datetime`、`Duration` | `Date` 是 i32 天数；`Datetime` 构造默认微秒精度 |
+| 嵌套 | `List`、`Array`、`Struct` | 变长列表 / 定宽定长 / 一行内的命名字段 |
+| 编码 | `String`、`Categorical`、`Enum` | 原生字符串缓冲 / 动态字典 / 固定字典 |
+
+时间类型的默认精度值得亲手确认一次：
+
+```python
+import datetime as dt
+
+df = pl.DataFrame({"ts": [dt.datetime(2026, 8, 1, 12, 30)]})
+print(df.schema["ts"])
+# Datetime(time_unit='us', time_zone=None)——Python datetime 构造默认落到微秒精度
+# 需要纳秒：cast(pl.Datetime("ns"))；需要时区：cast(pl.Datetime("us", "Asia/Shanghai"))
+```
+
+嵌套三兄弟一句话区分：`List` 每行长度可变（`[[1, 2], [3]]`）；`Array` 宽度写死在 dtype 里（`Array(Int64, 2)` 只装恰好两个元素，还能嵌套成多维）；`Struct` 是一行内的命名字段（`Struct({'x': Int64, 'y': String})`），相当于把宽表的一小段折叠进单列。
+
+编码三选一的取舍：高基数或近似唯一 → `String`；低基数且类别未知、会增长 → `Categorical`（字典随数据动态生长）；低基数且类别固定已知 → `Enum`（编译期校验取值，排序语义随声明固定，第 9 章）。
+
+### String 不是 Python str 对象的集合
+
+pandas 的 object 列本质是 **PyObject 指针数组**：每个元素指向一个散落在 Python 堆上的 `str` 对象，任何比较/哈希/排序都要先解引用、再进解释器。Polars 的 `String` 列是**独立的 Rust 字符串缓冲区**：字节连续存放，每行只持有一个 view（指针 + 长度 + 偏移），sort/filter/contains 等操作直接在缓冲区上向量化执行，全程不经过 Python 解释器。量级差异一句话：百万行 String 列 `sort()` 实测约 13 ms，同样数据转 Python 列表再 `sorted()` 约 104 ms——差的就是每个元素一次解释器对象开销（polars 1.44 / macOS arm64 实测）。
+
+```python
+import random
+
+random.seed(0)
+words = [f"city_{i}" for i in range(1000)]
+col = [random.choice(words) for _ in range(1_000_000)]
+s = pl.Series("w", col)
+
+s.sort()      # ≈ 13 ms：直接在 Rust 缓冲区上向量化
+sorted(col)   # ≈ 104 ms：百万次 PyObject 解引用 + 解释器比较
+```
+
+### dtype 检查工具
+
+`df.schema` 返回"列名 → dtype"的有序映射，`df.dtypes` 只列类型序列。lazy 侧的正确姿势是 `lf.collect_schema()` **方法**——`LazyFrame` 的 `.schema` 属性在 1.x 已软废弃：属性访问仍能取到值，但每次都触发 `PerformanceWarning`（解析 lazy schema 需要推演整个查询计划，代价可能不小）。肌肉记忆：**eager 用属性、lazy 用方法**。
+
+```python
+lf = pl.LazyFrame({"a": [1, 2], "b": ["x", "y"]})
+print(lf.collect_schema())   # Schema({'a': Int64, 'b': String})——官方姿势
+# lf.schema                  # 1.44 实测仍可用，但触发 PerformanceWarning，别写进生产代码
+
+df = pl.DataFrame({"a": [1, 2]})
+print(df.schema)             # Schema({'a': Int64})（eager：schema 直接在手）
+print(df.dtypes)             # [Int64]
+```
+
 ```python
 # dtype 决定行为：String 列的 sort 与 Categorical 的 sort 代价完全不同
 df = pl.DataFrame({"city": ["上海", "北京", "上海", "深圳"]})

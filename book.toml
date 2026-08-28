@@ -1,0 +1,19 @@
+[book]
+title = "Polars 高效数据处理实战"
+authors = ["jtcheng"]
+language = "zh"
+src = "src"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+renderer = ["html"]
+
+[output.html]
+git-repository-url = "https://github.com/example/polars-book"
+edit-url-template = "https://github.com/example/polars-book/edit/main/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30

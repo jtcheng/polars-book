@@ -1,0 +1,16 @@
+# 构建产物
+book/
+example_data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# mdbook-mermaid 前端资源（mdbook-mermaid install 自动恢复）
+mermaid.min.js
+mermaid-init.js
+
+# 系统
+.DS_Store

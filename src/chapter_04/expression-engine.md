@@ -7,16 +7,17 @@
 ```mermaid
 flowchart LR
     A["pl.col('price').filter(...).sum()"] --> B["表达式树<br/>（Python 侧轻量包装）"]
-    B --> C["逻辑计划"]
+    B -->|"eager：DataFrame.select<br/>调用即执行"| F["Rust 内核<br/>向量化执行"]
+    B -->|"lazy：嵌入逻辑计划"| C["逻辑计划"]
     C --> D["优化器规则<br/>谓词下推/投影裁剪"]
     D --> E["物理计划"]
-    E --> F["Rust 内核<br/>向量化执行"]
+    E --> F
 ```
 
 - `pl.col('x')` 本身不触发任何计算
 - Python 只负责描述，执行完全在 Rust 侧
 
-写下 `pl.col('price') * 1.13` 时，Python 侧发生的只是把一个新节点挂到计算树上——树在生长，数据纹丝不动；操作对象是什么、何时执行，全部只存在于这棵树的描述里。真正的执行发生在 collect：整棵树被一次性翻译成物理计划交给 Rust 内核，而不是每个算子各自进出一次解释器。正因如此，后面几节才能看到同一棵描述树被优化器改写、被跨上下文复用、被整体翻译——"先描述、后执行"是表达式系统一切性质的根源。
+写下 `pl.col('price') * 1.13` 时，Python 侧发生的只是把一个新节点挂到计算树上——树在生长，数据纹丝不动；操作对象是什么、何时执行，全部只存在于这棵树的描述里。执行有两条路径：eager 的 `DataFrame.select` 在调用时就把整棵表达式树交给 Rust 内核向量化执行（不做查询级优化）；lazy 的 `LazyFrame` 则把表达式嵌入逻辑计划，`collect` 时先经优化器改写、再翻译成物理计划执行。无论哪条路径，中间都不存在逐算子进出解释器——"先描述、后执行"是表达式系统一切性质的根源。
 
 ```python
 import polars as pl
@@ -25,7 +26,7 @@ import polars as pl
 price = pl.col("price")
 taxed = price * 1.13
 discounted = pl.when(price > 1000).then(price * 0.9).otherwise(price)
-# 整棵树在 collect 时一次性翻译执行
+# eager：select 调用时整棵树一次性进入 Rust 内核（无查询级优化）
 
 df = pl.DataFrame({"price": [1200, 300, 850]})
 print(df.select(
@@ -33,15 +34,15 @@ print(df.select(
     discounted.alias("final"),
 ))
 # shape: (3, 2)
-# ┌──────────┬───────┐
-# │ with_tax │ final │
-# │ ---      │ ---   │
-# │ f64      │ f64   │
-# ╞══════════╪═══════╡
-# │ 1356.0   │ 1080.0│
-# │ 339.0    │ 300.0 │
-# │ 960.5    │ 850.0 │
-# └──────────┴───────┘
+# ┌──────────┬────────┐
+# │ with_tax ┆ final  │
+# │ ---      ┆ ---    │
+# │ f64      ┆ f64    │
+# ╞══════════╪════════╡
+# │ 1356.0   ┆ 1080.0 │
+# │ 339.0    ┆ 300.0  │
+# │ 960.5    ┆ 850.0  │
+# └──────────┴────────┘
 ```
 
 ### 亲眼看两个计划：explain 的优化前后
@@ -51,10 +52,19 @@ print(df.select(
 ```python
 import polars as pl
 
-# 先造一张 12 列的表，让优化空间看得见
+# 先造一张 12 列的订单表，让优化空间看得见
+# （user_id / ts / amount 为业务列，col_00~08 为填充列——本章及第 5、6 章共用此表）
 N = 100_000
-cols = {"user_id": pl.int_range(0, N, dtype=pl.Int64) % 5_000}
-for j in range(11):
+cols = {
+    "user_id": pl.int_range(0, N, dtype=pl.Int64) % 5_000,
+    "ts": pl.datetime_range(
+        pl.datetime(2026, 8, 1),
+        pl.datetime(2026, 8, 1) + pl.duration(seconds=N - 1),
+        interval="1s",
+    ),
+    "amount": pl.int_range(0, N, dtype=pl.Int64) % 500 + 1,
+}
+for j in range(9):
     cols[f"col_{j:02d}"] = pl.int_range(0, N, dtype=pl.Int64) % 100
 pl.select(**cols).write_parquet("orders.parquet")
 
@@ -122,7 +132,7 @@ for _ in range(100_000):
     e = taxed                           # 循环内只是引用
 t_reuse = time.perf_counter() - t0
 print(f"每次新建: {t_build:.3f}s vs 复用: {t_reuse:.3f}s")
-# 实测：每次新建 0.141s vs 复用 0.002s —— 单个约 1.4 µs
+# 实测：每次新建 ~0.14s vs 复用 ~0.002s —— 单个约 1.4 µs（polars 1.44.1）
 ```
 
 日常几十上百个表达式完全无感；但要警惕在十万次级的热循环里每次重建表达式——累计 0.14 s 的纯构建开销（对照 4.3 节：100 万行的整列乘法才约 1 ms）。表达式是"图纸"不是"工件"：画一次，到处用。
@@ -132,7 +142,7 @@ print(f"每次新建: {t_build:.3f}s vs 复用: {t_reuse:.3f}s")
 - 逐元素循环 vs 整列批量指令
 - 缓存行一次装载 8 个 Float64
 
-向量化的收益来自两级：指令级——一条 SIMD 指令一次处理一批元素，把逐元素循环的分支与循环开销摊到整批上；内存级——顺序访问让预取器始终有活干，内存等待被计算时间掩盖。下面的对比里 NumPy 同样是向量化的，所以差距并不来自向量化本身，而来自 Polars 把整列切成多个分区、交给线程池并行处理（第 7 章）——单线程向量化是下限，多线程把它抬到接近核数的倍数。
+向量化的收益来自两级：指令级——一条 SIMD 指令一次处理一批元素，把逐元素循环的分支与循环开销摊到整批上；内存级——顺序访问让预取器始终有活干，内存等待被计算时间掩盖。SIMD 幅宽取决于目标架构（x86 的 AVX2/AVX-512、Arm 的 NEON），Polars 内核的向量化主要来自 Rust 编译期的自动向量化加少量手写内核——这也意味着具体加速比随指令集而变，不必执着于固定倍数。但有一个必须建立的前提认知：**逐元素算术是内存带宽受限操作**。5000 万个 Float64 相加，数据本身要搬 800 MB，单线程的顺序扫描就已经把内存带宽吃满——此时多线程没有富余带宽可瓜分，分区与线程协调的开销反而可能倒贴。NumPy 同样是单线程向量化的，所以这类操作两者半斤八两（实测见下）。Polars 多线程的真正优势在**计算密集**操作：聚合、group_by、join、字符串处理——每个字节进内存后要做多次计算，多核才有活干（第 1、7 章的基准都属此类）。
 
 ```python
 import time
@@ -158,7 +168,9 @@ t_np = bench(lambda: a_np + b_np)
 sa, sb = pl.Series(a_np), pl.Series(b_np)
 t_pl = bench(lambda: sa + sb)
 print(f"NumPy {t_np * 1e3:.1f} ms vs Polars {t_pl * 1e3:.1f} ms")
-# 典型结果：Polars 快 1~4 倍（取决于核数）
+# 实测：两者相当，Polars 甚至可能略慢（带宽受限，多线程无利可图）
+# （polars 1.44.1：NumPy ~14 ms vs Polars ~34 ms；换成 sum()/group_by 等
+#   计算密集操作，多线程优势才会显现——见第 7 章）
 ```
 
 ### 表达式在上下文中求值
@@ -177,11 +189,20 @@ df.group_by("user").agg(pl.col("amount").sum())  # 分组聚合
 
 元素级表达式的独立可组合——每一行的结果只依赖同一行的输入——正是流式引擎逐块执行的基础（第 8 章）。
 
+### 上下文的物理执行形态：聚合为什么能两阶段
+
+"同一表达式、不同上下文"不只是语义差异，引擎为每个上下文生成**不同的执行结构**。最值得理解的是 group_by 上下文的两阶段求值：`pl.col("amount").sum()` 在 agg 里不是"每组各自把列表加一遍"，而是被分解为**部分聚合（partial）→ 合并（final）**两个物理步骤——每个线程扫到自己那段数据时，先在本地哈希表里为每个组键累加一个部分和；所有段扫完，再把各线程的部分和按组键合并出最终值。`sum`/`mean`/`min`/`max`/`count` 都有这种"可分解"的聚合状态（一个标量或两个标量），所以：
+
+- 多线程各自扫各自的段，互不等待——并行度不受组数限制（第 7 章）
+- 状态大小只随**组键基数**增长、不随行数增长——这就是流式聚合内存受控的根源（第 8 章），也是第 14 章 p99 例外论断的由来：`quantile` 的聚合状态是"全组所有值"，无法分解成固定大小的部分状态，两阶段框架装不下它
+
+窗口（over）上下文则又是另一种结构：引擎按分区键把列分组、并行算完后把结果**回贴**到原行位置——比 agg 多一趟"分组计算 + 原位写回"（第 10 章展开代价）。
+
 ## 4.3 为什么不经过 Python 解释器
 
 - pandas 的 `df['a'] > 5`：掩码计算也在 NumPy，但复杂链式操作会多次往返
 - Polars：一次进入引擎、一次返回结果
-- `Series.map_elements`（旧名 `apply`，1.44 已移除）的代价对比（引出第 13 章 UDF 边界）
+- `Series.map_elements`（旧名 `apply`，已移除）的代价对比（引出第 13 章 UDF 边界）
 
 解释器开销的特点是按次数计费：每次 Python↔Rust 边界穿越都要把数据从连续缓冲区拆成 Python 对象、算完再装回去，单次成本固定、随调用次数线性累积。pandas 的单个操作并不慢——比较与算术同样跑在 NumPy 的 C 内核里——问题出在链式组合：每一步都返回新的中间对象，复杂管道等于在两层表示之间反复搬运，每步物化一份新的临时数组。Polars 的整条链只在进出两端各穿越一次边界，中间全部以原生表达式在引擎内流转；`map_elements` 则相当于主动把边界搬到每一行上，先看正反两面的对照：
 
@@ -202,12 +223,13 @@ big = pl.select(x=pl.int_range(0, 1_000_000, dtype=pl.Int64).cast(pl.Float64))
 
 t0 = time.perf_counter()
 big.select(pl.col("x") * 2)
-t_expr = time.perf_counter() - t0          # 典型值：~1 ms
+t_expr = time.perf_counter() - t0          # 实测 ~1 ms
 
 t0 = time.perf_counter()
 big.select(pl.col("x").map_elements(lambda v: v * 2))
-t_udf = time.perf_counter() - t0           # 典型值：~300 ms
+t_udf = time.perf_counter() - t0           # 实测 ~60 ms（视机器，慢解释器上可达数百 ms）
 print(f"表达式快 {t_udf / t_expr:.0f} 倍")
+# polars 1.44.1 实测：~0.9 ms vs ~58 ms，约 60 倍
 ```
 
 ## 要点回顾

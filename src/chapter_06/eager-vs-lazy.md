@@ -104,21 +104,25 @@ filter 尽量移到扫描层，让存储引擎跳过无关数据（Parquet 行�
 
 ```python
 # 观察 filter 下推如何跨 join 移动：大表 join 小表
+# orders.parquet 为第 4 章生成的 12 列订单表；users 为 3 列维表
 orders = pl.scan_parquet("orders.parquet")     # 大表
 users = pl.scan_parquet("users.parquet")       # 小表
 
 print((orders
-   .join(users, on="k")
+   .join(users, on="user_id")
    .filter(pl.col("amount") > 100)
    .explain()))
-# 典型输出：
+# 实测输出（polars 1.44.1）：
 # INNER JOIN:
-#   LEFT PLAN ON: [col("k")]
-#     Parquet SCAN [orders.parquet]
-#     PROJECT */2 COLUMNS
-#     SELECTION: col("amount") > 100   ← filter 已下推到 orders 扫描层
-#   RIGHT PLAN ON: [col("k")]
-#     Parquet SCAN [users.parquet]
+# LEFT PLAN ON: [col("user_id")]
+#   Parquet SCAN [orders.parquet]
+#   PROJECT */12 COLUMNS
+#   SELECTION: col("amount") > 100   ← filter 已下推到 orders 扫描层
+#   ESTIMATED ROWS: 100000
+# RIGHT PLAN ON: [col("user_id")]
+#   Parquet SCAN [users.parquet]
+#   PROJECT */3 COLUMNS
+#   ESTIMATED ROWS: 3
 # END INNER JOIN
 ```
 

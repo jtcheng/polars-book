@@ -26,17 +26,17 @@
 | 旧写法 | 新写法 |
 |---|---|
 | `df.lazy()` 显式转换 | `scan_*` 直接返回 LazyFrame（无需 `lazy()`） |
-| `apply` | `map_elements`（语义区分更明确；1.44 中 `apply` 已移除） |
+| `apply` | `map_elements`（语义区分更明确；0.20 期间已移除） |
 | `pl.count()` | `pl.len()`（len 计行、count 计非 null，语义统一） |
-| `with_column` | `with_columns`（1.44 中已移除） |
-| `groupby` | `group_by`（1.44 中已移除） |
+| `with_column` | `with_columns`（1.0 前已移除） |
+| `groupby` | `group_by`（1.0 前已移除） |
 | `df.melt(id_vars, value_vars)` | `df.unpivot(index, on)` |
 | `read_csv(dtypes=...)` / `scan_csv(dtypes=...)` | `schema_overrides=...` |
 | `collect(streaming=True)` | `collect(engine="streaming")`（1.25 起改参数） |
 | `join(how="outer")` | `join(how="full")`（`outer` 0.20.29 起弃用） |
 | `concat(how="horizontal")` | `how="horizontal", strict=True`（行数须相等）或 `how="horizontal_extend"`（不等补 null） |
 | `pl.enable_string_cache()` | 不再需要——跨字典 Categorical join 自动 remap（1.x 行为） |
-| `s.cat.get_categories()` | `s.unique()`（查看类别） |
+| `s.cat.get_categories()` | `s.unique()`（查看取值；Enum 的类别表用 `dtype.categories`，2.0 将移除该方法） |
 | `lf.profile()` 定位热点 | 1.43 起弃用——改用基准计时 + 实测峰值 RSS（第 8、12 章） |
 
 ## C.4 锁版本建议

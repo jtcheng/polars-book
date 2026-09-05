@@ -54,13 +54,23 @@ out = WORK / "error_stats.parquet"
       .sink_parquet(out)
 )
 stats = pl.read_parquet(out)
-print(f"\n流式管道产出: {stats.height} 行（3 天 × 4 端点 = 12）")
+print(f"\n流式管道产出: {stats.height} 行（3 天 × 24 小时 × 4 端点 = 288）")
 print(stats.sort("hour", "endpoint").head(6))
 
-# --- 第 5 章：链式 vs 逐步赋值（profile 对比）---
-lazy_result, lazy_stats = lf.select(pl.col("latency_ms").mean()).profile()
-print("\n链式执行节点耗时（微秒）:")
-print(lazy_stats)
+# --- 第 5 章：链式 vs 逐步赋值（计时对比；profile 自 1.43 起弃用，见 12.1 的替代工具）---
+import time
+
+df_eager = pl.read_parquet(WORK / "date=2026-08-*" / "*.parquet")
+t0 = time.perf_counter()
+step = df_eager.filter(pl.col("level") == "ERROR").select(pl.col("latency_ms").mean())
+t_step = time.perf_counter() - t0
+
+lf_mean = lf.select(pl.col("latency_ms").mean())
+lf_mean.collect()                       # 预热
+t0 = time.perf_counter()
+lf_mean.collect()
+t_lazy = time.perf_counter() - t0
+print(f"\n逐步赋值: {t_step*1e3:.1f} ms vs 惰性链式: {t_lazy*1e3:.1f} ms")
 
 # 清理示例数据
 import shutil

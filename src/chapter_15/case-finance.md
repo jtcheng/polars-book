@@ -65,7 +65,8 @@ pl.DataFrame({
 ## 15.2 多表 join 组装宽表
 
 ```python
-# 交易对齐到其后最近一根 K 线（成交发生在报价之后）
+# 交易对齐到信号时刻之前最近一根 K 线
+# （backward = 不晚于信号时刻的最新报价——只用已发生的数据，防前视偏差）
 bars_sorted = bars.sort("ts").set_sorted("ts")
 
 filled = (
@@ -164,11 +165,13 @@ equity = (
                     .over("symbol"),      # 每个标的独立持仓状态
     )
     # 持仓收益 = 前一日持仓 × 当日涨跌幅（T 日收盘出信号，T+1 日才持仓）
+    # pct_change 与 shift 都必须 over("symbol")：多标的拼接时首行的"前一值"
+    # 是别的标的的收盘价，不分组会把跨标的收益算进第一行
     .with_columns(
-        daily_ret=pl.col("close").pct_change(),
+        daily_ret=pl.col("close").pct_change().over("symbol"),
     )
     .with_columns(
-        strat_ret=pl.col("daily_ret") * pl.col("position").shift(1).fill_null(0),
+        strat_ret=pl.col("daily_ret") * pl.col("position").shift(1).over("symbol").fill_null(0),
     )
     # 权益曲线与回撤
     .with_columns(

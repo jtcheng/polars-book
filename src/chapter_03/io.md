@@ -41,7 +41,7 @@ lf = (
 )
 print(lf.explain())
 # 输出中可见 SELECTION: col("amount") > 1000
-# 与 PROJECT 2/12 COLUMNS —— 12 列只读 2 列
+# 与 PROJECT 2/12 COLUMNS —— 12 列只读 2 列（polars 1.44.1 实测）
 ```
 
 ## 3.2 各格式选型
@@ -62,17 +62,20 @@ lf = pl.scan_csv(
     "events.csv",
     schema_overrides={
         "user_id": pl.Int64,
-        "ts": pl.Datetime,            # 或 try_parse_dates=True
+        "ts": pl.Datetime,            # 仅认 ISO8601 变体，或用 try_parse_dates=True
         "city": pl.Categorical,
     },
     null_values=["", "NULL", "\\N"],
 )
 ```
 
+> **坑**：`schema_overrides` 指定 `pl.Datetime` 后，CSV 解析只接受 ISO8601 变体（如 `2026-08-27T10:00:00`）；时间戳是自定义格式（如 `2026/08/27 10:00`）时直接报错。此时应把 ts 读成 String，再显式转型（见下）。
+
 ### CSV 转存 Parquet 一次，后续每次都快
 
 ```python
-(pl.scan_csv("events.csv")
+# ts 是非 ISO 格式：先读成 String，再按显式格式转型
+(pl.scan_csv("events.csv", schema_overrides={"ts": pl.String})
    .with_columns(pl.col("ts").str.to_datetime("%Y-%m-%d %H:%M:%S"))
    .sink_parquet("events.parquet"))
 ```
@@ -83,7 +86,7 @@ lf = pl.scan_csv(
 - 内存映射：`memory_map` 参数
 - 云存储：`scan_parquet("s3://...")` 的行为
 
-谓词下推之所以可能，是因为每个行组的每一列都在文件 footer 里登记了 min/max 统计——引擎先花几 KB 读这份"目录"，再决定跳过哪些块（下一小节把它打印出来看个究竟）。内存映射是 eager 路径的另一个杠杆：`read_parquet(memory_map=True)` 把文件页直接映射进地址空间，省掉一次内核到用户空间的数据复制。云存储上 `scan_parquet("s3://...")` 的行为逻辑相同——footer 统计照样可用，只是每次范围读取都要付一次网络往返，因此行组与文件的切分粒度对成本的影响比本地大得多。
+谓词下推之所以可能，是因为每个行组的每一列都在文件 footer 里登记了 min/max 统计——引擎先花几 KB 读这份"目录"，再决定跳过哪些块（下一小节把它打印出来看个究竟）。内存映射是 eager 路径的一个条件杠杆：`read_parquet(memory_map=True, use_pyarrow=True)` 把文件页直接映射进地址空间，省掉一次内核到用户空间的数据复制——**仅在 `use_pyarrow=True` 路径生效**（polars 原生 reader 不走 mmap），且只对未压缩的数据页有实质收益（压缩列即便映射了文件页，解码仍要物化到内存）。云存储上 `scan_parquet("s3://...")` 的行为逻辑相同——footer 统计照样可用，只是每次范围读取都要付一次网络往返，因此行组与文件的切分粒度对成本的影响比本地大得多。
 
 ```python
 # 行组统计信息：数据还没读，存储层就能跳过整个行组
@@ -96,6 +99,8 @@ print(pf.metadata.row_group(0).column(0).statistics)
 ```
 
 ### 行组统计：数据还没读，先查"目录"
+
+Parquet 的物理结构分三级：**行组（row group）→ 列块（column chunk）→ 页（page）**。行组是水平切片，其中的每一列对应一个列块；列块内部再按页（page）切分——页才是编解码的最小单元，而行组只是**跳过**的最小单元（统计信息挂在行组级）。扫描并行度也与行组对应：多行组文件可按行组分给多个线程各自解码，行组过少会限制扫描阶段的并行上限。
 
 上面最后一行打印的 `statistics`，就是 Parquet 谓词下推的物理基础。Parquet 文件在水平方向切成若干**行组（row group）**，每个行组的每一列都在文件 footer 里登记了 min/max/null_count 统计。`scan_parquet` 执行时先读 footer（KB 级），把过滤条件与各行组的 min/max 对比——区间与条件完全不相交的行组**整块跳过，一个字节都不读**。
 
@@ -131,7 +136,7 @@ for i in range(pf.metadata.num_row_groups):
 # 行组 9: ts ∈ [2026-01-11 10:00:00, 2026-01-12 13:46:39]
 ```
 
-十个行组的 ts 区间严格递增、互不重叠。于是查询"1 月 10 日零点以后的事件"时，前 7 个行组的 max 都早于阈值，直接整块跳过——实测只有 22% 的行被真正解码。**数据还没读，存储层就替你完成了大半过滤**，这正是 3.1 节 explain 输出里 `SELECTION` 最终落到的地方。
+十个行组的 ts 区间严格递增、互不重叠。于是查询"1 月 10 日零点以后的事件"（阈值 = 第 777 600 秒）时：行组 0–6（第 0–699 999 秒）的 max 都早于阈值，直接整块跳过；阈值落在行组 7 内，行组 7–9 被读取并解码——只有 30% 的行被解码，其中约 22%（222 400 行）通过谓词进入最终结果。注意跳过是**行组粒度**的：组内没有行级跳过，命中行组仍整组解码。**数据还没读，存储层就替你完成了大半过滤**，这正是 3.1 节 explain 输出里 `SELECTION` 最终落到的地方。
 
 ### 写入侧的配合：排序决定统计信息的质量
 
@@ -198,7 +203,7 @@ def bench(pred):
 print(f"id > 9_990_000: {bench(pl.col('id') > 9_990_000) * 1e3:.1f} ms")
 print(f"id > 5_000_000: {bench(pl.col('id') > 5_000_000) * 1e3:.1f} ms")
 print(f"id > 1_000_000: {bench(pl.col('id') > 1_000_000) * 1e3:.1f} ms")
-# 实测（Apple Silicon，页缓存热，5 次取最优）：
+# 实测（polars 1.44.1，Apple Silicon，页缓存热，5 次取最优）：
 # id > 9_990_000:   8.4 ms   —— 9/10 行组整块跳过，只解码最后 1 个行组
 # id > 5_000_000:  39.2 ms   —— 跳过 5/10
 # id > 1_000_000:  60.8 ms   —— 跳过 1/10
@@ -216,9 +221,10 @@ sample = pl.select(
     user_id=pl.int_range(0, N, dtype=pl.Int64) % 10_000,
     amount=pl.int_range(0, N, dtype=pl.Int64) % 500,
 )
-for codec in ["zstd", "lz4", "snappy"]:
+for codec in ["zstd", "lz4", "snappy", "uncompressed"]:
     sample.write_parquet(f"events_{codec}.parquet", compression=codec)
-# 实测落盘大小：zstd 1.4 MB ／ lz4 4.7 MB ／ snappy 6.2 MB（uncompressed 11.6 MB）
+# 实测落盘大小（polars 1.44.1 / macOS arm64，100 万行 × 3 列整型）：
+# zstd 1.4 MB ／ lz4 4.7 MB ／ snappy 6.2 MB ／ uncompressed 11.6 MB
 ```
 
 选型一句话：
@@ -227,7 +233,7 @@ for codec in ["zstd", "lz4", "snappy"]:
 - **lz4**：解压最快，适合会被反复重读的中间数据、热缓存
 - **snappy**：只在对接只认 snappy 的老旧读取器时才需要
 
-列存 + 规律性强的整型数据是 zstd 的主场（本例压到原始大小的 12%）；数据越随机三者差距越小，但 zstd 依然不亏——没有理由不保留默认。
+列存 + 规律性强的整型数据是 zstd 的主场。注意各数字的基数不同：uncompressed 的 11.6 MB 也已应用 Parquet 的字典/RLE 编码（同数据的内存占用是 22.9 MB），zstd 的 1.4 MB 相对编码后是 12%、相对原始内存是 6%。数据越随机三者差距越小，但 zstd 依然不亏——没有理由不保留默认。
 
 ### 分区目录：文件之外的另一级跳过
 

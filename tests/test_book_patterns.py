@@ -102,7 +102,7 @@ def test_ch10_join_semantics():
     assert left.join(right.select("k"), on="k", how="semi").height == 2
     assert left.join(right.select("k"), on="k", how="anti").height == 2
     assert left.join(right, on="k", how="left").height == 4
-    assert left.join(right, on="k", how="outer", coalesce=True).height == 5
+    assert left.join(right, on="k", how="full", coalesce=True).height == 5
 
 
 def test_ch10_len_vs_count():

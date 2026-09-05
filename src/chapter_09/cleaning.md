@@ -122,7 +122,7 @@ df.with_columns(pl.col("flag").cast(pl.Int8))   # 上限 127
 - 多编码：`len_bytes` vs `len_chars`
 - 正则的预编译与回退成本
 
-`.str` 命名空间快在执行层级：每个方法对应一个列级向量化内核，一次原生调用处理整列，而不是 Python 层的逐行调度——这是它能留在快路径的原因，也是边界：内核没实现的复杂逻辑才需要退到 `map_elements`。`len_chars` 与 `len_bytes` 的分歧来自 UTF-8 变长编码——"数据"两个字符占 6 个字节——截断、过滤、分箱时选错语义，中文场景直接出错。正则的成本另算：`literal=True` 走纯子串搜索，进正则引擎则模式越复杂常数越大（实测 200 万行 `contains("hij")`：literal 约 14 ms，正则模式 `ab.*hij` 约 40 ms，约 3 倍差距）——高频路径上的字面量匹配值得显式声明。
+`.str` 命名空间快在执行层级：每个方法对应一个列级向量化内核，一次原生调用处理整列，而不是 Python 层的逐行调度——这是它能留在快路径的原因，也是边界：内核没实现的复杂逻辑才需要退到 `map_elements`。`len_chars` 与 `len_bytes` 的分歧来自 UTF-8 变长编码——"数据"两个字符占 6 个字节——截断、过滤、分箱时选错语义，中文场景直接出错。正则的成本另算：`literal=True` 走纯子串搜索，进正则引擎则模式越复杂常数越大（实测 200 万行 `contains("hij")`：literal 约 14 ms，正则模式 `ab.*hij` 约 40 ms，约 3 倍差距；polars 1.44.1 / macOS arm64）——高频路径上的字面量匹配值得显式声明。
 
 ```python
 df = pl.DataFrame({
@@ -130,13 +130,25 @@ df = pl.DataFrame({
     "path": ["/a/b/c.txt", "/d/e.csv", "/f/g.parquet"],
 })
 
+# ⚠️ 同一个 with_columns 里的表达式都基于同一份输入求值：
+# is_corp 读到的 email 是"未规范化"的原始列（含空格、大写），
+# Alice 会被误判为 false
 df.with_columns(
     email=pl.col("email").str.strip_chars().str.to_lowercase(),
-    is_corp=pl.col("email").str.ends_with("@corp.com"),
-    ext=pl.col("path").str.split(".").list.last(),      # 切分后取列表元素
+    is_corp=pl.col("email").str.ends_with("@corp.com"),   # ❌ false / true / null
+)
+
+# 正确：依赖前一步产物的判断放到下一个 with_columns
+df.with_columns(
+    email=pl.col("email").str.strip_chars().str.to_lowercase(),
+).with_columns(
+    is_corp=pl.col("email").str.ends_with("@corp.com"),   # ✅ true / true / null
+    ext=pl.col("path").str.split(".").list.last(),        # 切分后取列表元素
     depth=pl.col("path").str.count_matches("/"),
 )
 ```
+
+> **同批表达式互不可见**：`with_columns`/`select` 中所有表达式都在同一输入 DataFrame 上并行求值，任何一个表达式都看不到同批其他表达式的输出。需要"先变换、再基于变换结果判断"时，必须拆成两次链式调用——这也解释了为什么长管道天然应该写成多步方法链。
 
 ```python
 # len_bytes vs len_chars：中文场景必须区分
@@ -160,6 +172,8 @@ print(df.estimated_size("mb"))                            # String: ~5.7 MB
 print(df.with_columns(pl.col("city").cast(pl.Categorical))
         .estimated_size("mb"))                            # ~3.8 MB
 # 实测值：100 万行、2 个类别，polars 1.44 / macOS arm64
+# 注意：estimated_size 对 String 列未计入每行 16 字节的 view 结构，
+# String 列的真实内存还要再加约 16 MB——字典编码的真实收益比数字显示的更大
 
 # Enum：类别固定且已知时更优（编译期检查 + 无重编码开销）
 Weekday = pl.Enum(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
@@ -187,7 +201,7 @@ enum_side.with_columns(pl.col("d").cast(pl.Categorical)).join(cat_side, on="d")
 
 ### Categorical 的 sort 顺序：physical vs lexical
 
-字典编码列的排序有两种语义：**lexical**（按字符串本身的次序）与 **physical**（按字典索引，即类别首次出现的顺序）。1.32 起，用于切换的 `Categorical(ordering="physical"/"lexical")` 参数已废弃——Categorical 的 `sort()` 恒为 lexical；要按出现顺序排，就显式排物理索引列 `to_physical()`。`Enum` 则不同：排序恒按**类别声明的顺序**，语义在定义时就固定，这也是它"固定字典"红利的另一面。
+字典编码列的排序有两种语义：**lexical**（按字符串本身的次序）与 **physical**（按字典索引，即类别首次出现的顺序）。用于切换的 `Categorical(ordering="physical"/"lexical")` 参数已废弃（1.44 实测触发 `DeprecationWarning`，官方口径：排序恒为 lexical，2.0 将移除该参数）——Categorical 的 `sort()` 恒为 lexical；要按出现顺序排，就显式排物理索引列 `to_physical()`。`Enum` 则不同：排序恒按**类别声明的顺序**，语义在定义时就固定，这也是它"固定字典"红利的另一面。
 
 ```python
 df = pl.DataFrame({"fruit": ["banana", "apple", "cherry", "apple"]})

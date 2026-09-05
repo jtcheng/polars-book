@@ -52,7 +52,7 @@ Categorical/Enum 选型：类别未知或会增长用 `Categorical`（跨字典 
 | 求和 | `pl.col("x").sum()` | `df["x"].sum()` |
 | 均值 | `pl.col("x").mean()` | `df["x"].mean()` |
 | 中位数 | `pl.col("x").median()` | `df["x"].median()` |
-| 分位数 | `pl.col("x").quantile(0.9)` | `df["x"].quantile(0.9)` |
+| 分位数 | `pl.col("x").quantile(0.9, interpolation="linear")`（polars 默认 `nearest`，跨库对齐须显式指定） | `df["x"].quantile(0.9)`（默认 linear） |
 | 唯一计数 | `pl.col("x").n_unique()` | `df["x"].nunique()` |
 | 近似基数（大表） | `pl.col("x").approx_n_unique()` | — |
 | 直方图 | `s.hist(bin_count=10)`（Series 方法） | — |

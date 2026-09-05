@@ -45,7 +45,7 @@ flowchart TB
 |---|---|---|
 | `.str` | String | `contains` `split` `replace` `slice` `to_datetime` `strip_chars` `len_bytes` `pad_start` |
 | `.dt` | Date/Datetime/Duration | `year` `month` `weekday` `hour` `truncate` `offset_by` `total_seconds` `round` |
-| `.cat` | Categorical/Enum | `physical` `slice` `starts_with` `ends_with`（`get_categories` 已弃用，改用 `unique()` 查看类别） |
+| `.cat` | Categorical/Enum | `physical` `slice` `starts_with` `ends_with` `len_chars`（`get_categories` 已弃用：Categorical 看取值用 `unique()`，Enum 看类别表用 `dtype.categories`，2.0 将移除） |
 | `.list` | List | `len` `get` `first` `join` `sum` `min` `eval` `unique` |
 | `.struct` | Struct | `field` `json_encode` `rename_fields` `unnest` |
 | `.bin` | Binary | `contains` `decode` `size` |
@@ -59,7 +59,7 @@ flowchart TB
 | 数学 | `sum` `mean` `std` `var` `log` `exp` `abs` `clip` `round` |
 | 统计 | `quantile` `median` `mode` `skew` `kurtosis` `n_unique` `approx_n_unique` `hist` |
 | 排名/序 | `rank` `cum_sum` `diff` `shift` `pct_change` `rolling_mean` `ewm_mean` `rle_id` `interpolate` |
-| 比较/逻辑 | `eq` `ne` `gt` `is_between` `is_null` `is_in` `and_`/`or_` |
+| 比较/逻辑 | `eq` `ne` `gt` `is_between` `is_null` `is_in` `and_`/`or_`（与运算符 `&`/`\|` 等价，方法形式便于传参组合） |
 | 分组上下文 | `over` `map_batches`（`map_elements` 走 Python，见第 4 章） |
 | 条件 | `fill_nan` `fill_null` `replace` |
 | 类型 | `cast` `is_finite` `is_infinite` |

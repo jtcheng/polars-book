@@ -33,7 +33,7 @@ classDiagram
 - Series：带类型的一维列
 - Expr：**尚未执行的计算描述**——Polars 性能哲学的起点
 
-三者是层层递进的关系：DataFrame 持有若干 Series，每个 Series 是一段带 dtype 的连续内存，而 Expr 只是描述"对哪些列做什么"的一棵计算树——它不持有数据，放进 select/filter 这类上下文之前不会发生任何求值。把"数据"与"计算描述"拆成两类对象，是后续一切优化的前提：计算意图以 Expr 的形式独立存在，引擎才能在执行前看到完整的计算树，做谓词下推与投影裁剪（第 4 章）。"列的集合"这一定位还有一层实际后果：整表 schema 在构造时就已确定，按列取数据是零成本的原生操作，而取一行要把各个列缓冲区的同一位置拼起来，天然走的是例外路径。
+三者是层层递进的关系：DataFrame 持有若干 Series，每个 Series 由一段（或多段）带 dtype 的连续缓冲组成——引擎以 chunk 为单位管理，多文件 scan 与 `concat` 天然产生多 chunk，必要时用 `rechunk()` 合并（第 7 章）；而 Expr 只是描述"对哪些列做什么"的一棵计算树——它不持有数据，放进 select/filter 这类上下文之前不会发生任何求值。把"数据"与"计算描述"拆成两类对象，是后续一切优化的前提：计算意图以 Expr 的形式独立存在，引擎才能在执行前看到完整的计算树，做谓词下推与投影裁剪（第 4 章）。"列的集合"这一定位还有一层实际后果：整表 schema 在构造时就已确定，按列取数据是零成本的原生操作，而取一行要把各个列缓冲区的同一位置拼起来，天然走的是例外路径。
 
 ### 动手感受三个对象
 
@@ -47,7 +47,7 @@ df = pl.DataFrame({
     "score": [90.5, 85.0, 78.5],
 })
 print(df.schema)
-# {'id': Int64, 'name': String, 'score': Float64}
+# Schema({'id': Int64, 'name': String, 'score': Float64})
 # 注意：dtype 是强类型的，不存在 pandas 的 object 兜底
 
 # Series：带类型的一维列
@@ -61,7 +61,7 @@ print(type(expr))            # <class 'polars.expr.expr.Expr'>
 # 此时没有任何计算发生——它只是"描述"
 ```
 
-关键心智模型：`pl.col("score") * 2 + 1` 在 pandas 里对应逐行求值，在 Polars 里是一棵待编译的表达式树，`collect()` 时整体翻译为 Rust 向量化内核（第 4 章）。
+关键心智模型：`pl.col("score") * 2 + 1` 在 pandas 里是**立即求值**的 NumPy 向量化运算——每个算子各扫一遍内存（本例两趟遍历、两个中间数组）；在 Polars 里它是一棵待编译的表达式树，求值时多个算子可**融合**为一个 Rust 向量化内核，一趟遍历完成（第 4 章）。差异不在"向量化与否"，而在"逐算子执行还是整树融合执行"。
 
 ## 2.2 Arrow 列式内存布局
 
@@ -112,11 +112,11 @@ print(df2.estimated_size("mb"))  # ≈ 3.9 MB
 
 ```python
 s = pl.Series("x", [1.0, None, float("nan")])
-print(s.is_null())   # [False, True, False]  值缺失
-print(s.is_nan())    # [False, None, True]   浮点未定义；null 位置传播为 null
-print(s.sum())       # nan 会传染；null 会被跳过 → 1.0 + nan = nan
+print(s.is_null())   # false / true / false —— 值缺失
+print(s.is_nan())    # false / null / true —— 浮点未定义；null 位置传播为 null
+print(s.sum())       # nan —— nan 会传染，null 会被跳过（1.0 + nan = nan）
 # 聚合前先处理：
-s.fill_nan(0).sum()          # 或先 fill_nan 再算
+print(s.fill_nan(0).sum())   # 1.0 —— 先 fill_nan 再聚合
 ```
 
 ### 零拷贝验证
@@ -156,7 +156,7 @@ import datetime as dt
 df = pl.DataFrame({"ts": [dt.datetime(2026, 8, 1, 12, 30)]})
 print(df.schema["ts"])
 # Datetime(time_unit='us', time_zone=None)——Python datetime 构造默认落到微秒精度
-# 需要纳秒：cast(pl.Datetime("ns"))；需要时区：cast(pl.Datetime("us", "Asia/Shanghai"))
+# 需要纳秒：cast(pl.Datetime("ns"))；需要挂时区：`dt.replace_time_zone("Asia/Shanghai")`（naive→aware 走"重新解释墙钟时间"语义；已有时区做换算用 `dt.convert_time_zone`，两者勿混）
 ```
 
 嵌套三兄弟一句话区分：`List` 每行长度可变（`[[1, 2], [3]]`）；`Array` 宽度写死在 dtype 里（`Array(Int64, 2)` 只装恰好两个元素，还能嵌套成多维）；`Struct` 是一行内的命名字段（`Struct({'x': Int64, 'y': String})`），相当于把宽表的一小段折叠进单列。
@@ -165,7 +165,7 @@ print(df.schema["ts"])
 
 ### String 不是 Python str 对象的集合
 
-pandas 的 object 列本质是 **PyObject 指针数组**：每个元素指向一个散落在 Python 堆上的 `str` 对象，任何比较/哈希/排序都要先解引用、再进解释器。Polars 的 `String` 列是**独立的 Rust 字符串缓冲区**：字节连续存放，每行只持有一个 view（指针 + 长度 + 偏移），sort/filter/contains 等操作直接在缓冲区上向量化执行，全程不经过 Python 解释器。量级差异一句话：百万行 String 列 `sort()` 实测约 13 ms，同样数据转 Python 列表再 `sorted()` 约 104 ms——差的就是每个元素一次解释器对象开销（polars 1.44 / macOS arm64 实测）。
+pandas 的 object 列本质是 **PyObject 指针数组**：每个元素指向一个散落在 Python 堆上的 `str` 对象，任何比较/哈希/排序都要先解引用、再进解释器。Polars 的 `String` 列基于**变长字符串视图（binview）布局**：字符串字节集中存放在共享缓冲区，每行持有一个 16 字节定宽 view 结构（长度 + 缓冲区指针/偏移，外加 12 字节内联空间）——不超过 12 字节的字符串整个内联在 view 里，无需第二次访存；比较与哈希先比内联前缀即可快速淘汰大量候选。sort/filter/contains 等操作直接在缓冲区上向量化执行，全程不经过 Python 解释器。量级差异一句话：百万行 String 列 `sort()` 实测约 13 ms，同样数据转 Python 列表再 `sorted()` 约 104 ms——差的就是每个元素一次解释器对象开销（polars 1.44 / macOS arm64 实测）。
 
 ```python
 import random
@@ -197,7 +197,8 @@ print(df.dtypes)             # [Int64]
 # dtype 决定行为：String 列的 sort 与 Categorical 的 sort 代价完全不同
 df = pl.DataFrame({"city": ["上海", "北京", "上海", "深圳"]})
 df_cat = df.with_columns(pl.col("city").cast(pl.Categorical))
-print(df_cat.get_column("city").to_physical())  # 字典索引 [0,1,0,2]
+print(df_cat.get_column("city").to_physical())  # 字典索引，如 [2, 3, 2, 4]
+# 注意：物理编码的具体取值与分配顺序是实现细节，勿依赖其语义
 ```
 
 ## 要点回顾
@@ -205,7 +206,7 @@ print(df_cat.get_column("city").to_physical())  # 字典索引 [0,1,0,2]
 - DataFrame 是列的集合；Expr 是计算的描述而非执行
 - Arrow 列式布局带来缓存友好、SIMD 可用、跨系统零拷贝
 - null（bitmap 标记）与 NaN（浮点值）语义不同，处理方式也不同
-- 列式布局是后续流式引擎分块（morsel）处理的前提——按列切块才能逐块流过计算内核
+- 列式布局是后续流式引擎分块（morsel）处理的前提——morsel 是十万行量级的水平切片，列式布局保证每个 morsel 内每一列都是连续内存，可独立流过计算内核（第 7 章）
 
 ## 性能检查清单
 

@@ -57,7 +57,9 @@ import polars as pl
    .sink_parquet("error_stats.parquet"))                    # 流式写出
 ```
 
-内存分析：管道的可变工作集 = 单个 morsel（几十万行）+ 增量哈希表（720 小时 × ~200 端点 ≈ 14 万键）。**输入 200GB，内存占用稳定在几十 MB**。
+内存分析：管道的可变工作集 = 单个 morsel（约 10 万行级）+ 增量哈希表（720 小时 × ~200 端点 ≈ 14 万键）——这两项都只随**基数**增长，不随输入行数增长。
+
+**但 p99 是个例外，必须单独说清**：`quantile` 无法增量聚合——引擎必须按组缓存**全部** latency 值才能在收尾算分位数，聚合状态随过滤后行数线性增长。实测（polars 1.44.1，5 倍输入放大、键基数不变，子进程峰值 RSS）：含 `quantile(0.99)` 的管道 235 MB → 780 MB（随输入等比增长，规模不变性检验不过）；把 p99 换成可增量聚合的 `mean`/`max` 后 138 MB → 238 MB（含进程基线，基本平稳）。结论：内存是硬约束时，把 p99 移出主 流式管道——要么单独跑一条只算分位数的管道（接受其内存代价），要么用 `approx` 类近似口径；主管道只留可增量聚合的指标（sum/mean/min/max/count）。这也正是 14.5 节"规模不变性"检验的价值：论断要靠实测兜底，包括本章自己的管道。
 
 ## 14.3 三层裁剪：分区、行组、投影
 
@@ -102,11 +104,11 @@ print(one_day.collect().height)   # 2000（只有 27 日的行）
 lf = (pl.scan_parquet("logs/date=2026-08-*/*.parquet")
         .filter(pl.col("level") == "ERROR"))
 print(lf.explain())
-# Parquet SCAN 中出现 SELECTION —— 存储层直接跳过 level 列
-# 不含 ERROR 的行组（统计信息可证明）整块跳过，读取量骤减
+# Parquet SCAN 中出现 SELECTION —— 谓词已下推到扫描层，
+# 存储层据此跳过统计信息证明"不含 ERROR"的行组
 ```
 
-Parquet 每个行组记录 min/max 统计。`level` 是低基数字符串，某行组的 min/max 都是 `"INFO"` 时整块跳过——对 20% 错误率的日志，实际读取量远小于全量。
+Parquet 每个行组记录 min/max 统计，某行组的 min/max 都是 `"INFO"` 时整块跳过。但**行组裁剪生效的前提是数据按过滤列聚簇**：错误按时间聚簇（事故时段连续刷 ERROR）时收益大；像本章演示数据这样错误随机散布在各小时，行组 min/max 几乎必然横跨 ERROR..WARN，整组跳过基本不生效——此时三层裁剪里真正干活的是分区裁剪与投影裁剪（呼应第 3 章"乱序写入退化为全表扫描"的结论）。写入侧按 level 预分区，或按时间聚簇后再写，才能把行组裁剪的收益兑现。
 
 ### 投影裁剪
 
@@ -136,7 +138,7 @@ Parquet 每个行组记录 min/max 统计。`level` 是低基数字符串，某�
 # anti join 去重：排除已入库的小时（幂等保证）
 already = pl.scan_parquet("error_stats.parquet").select("hour", "endpoint")
 
-(pl.scan_parquet("logs/date=2026-08-2*/*.parquet")         # glob 收窄到新增分区
+(pl.scan_parquet("logs/date=2026-08-2*/*.parquet")         # glob 粗筛（含新旧分区）
    .filter(pl.col("level") == "ERROR")
    .with_columns(hour=pl.col("ts").dt.truncate("1h"))
    .group_by(["hour", "endpoint"]).agg(pl.len().alias("n"))
@@ -170,7 +172,8 @@ import sys
 
 proc = subprocess.run([sys.executable, "pipeline.py"], check=True)
 peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-# macOS 返回字节，Linux 返回千字节
+if sys.platform == "linux":
+    peak *= 1024        # Linux 返回千字节，macOS 返回字节——统一成字节
 print(f"峰值 RSS: {peak / 1e6:.0f} MB")
 ```
 
@@ -193,6 +196,8 @@ print(f"峰值 RSS: {peak / 1e6:.0f} MB")
    .collect())
 ```
 
+一个隐藏前提：`pct_change(24)` 的"24 行之前"只有在**每小时都有统计行**时才等于"24 小时之前"。某端点在某小时零错误、该组缺失时，`over` 分组内的行序会错位——第 24 行之前可能已是 30 小时之前。这正是第 11 章"缺失周期让环比错位"的原样复现：严格的环比应先 `upsample` 补齐缺失小时（`fill_null(0)`）再算。本节示例以演示告警阈值为主，从简。
+
 告警阈值不只是拍脑袋的 50%：`pct_change` 对小基数极度敏感（n 从 1 涨到 2 就是 +100%）。更稳健的做法是给环比加最小样本门槛：
 
 ```python
@@ -211,7 +216,7 @@ print(f"峰值 RSS: {peak / 1e6:.0f} MB")
 
 | 量 | 示例规模 | 亿级规模 | 影响 |
 |---|---|---|---|
-| 聚合基数（hour × endpoint） | 48 键 | ~14 万键 | 增量哈希表是唯一随数据增长的内存项，需预估上限 |
+| 聚合基数（hour × endpoint） | 192 键（2 天 × 24 小时 × 4 端点） | ~14 万键 | 增量哈希表随基数（而非行数）增长，需预估上限；注意 `quantile` 例外——其聚合状态随行数增长（见 14.2） |
 | 分区数 | 2 | 数千 | glob 匹配与计划构建本身有开销；分区过碎时用 `hive_partitioning` + 日期 filter 优于宽 glob |
 | morsel 大小 | 不变 | 不变 | 引擎固定（约 10 万行级），单块处理时间稳定，是内存上界的锚点 |
 
@@ -236,7 +241,7 @@ print(f"峰值 RSS: {peak / 1e6:.0f} MB")
 
 ## 练习
 
-1. **模拟数据**：用 `pl.datetime_range` + 随机数生成分区日志（3 天 × 4 端点 × 10 万行/天），写入 `logs/date=*/part-0.parquet`，运行 14.2 节管道并验证输出行数 = 3 天 × 4 端点。
+1. **模拟数据**：用 `pl.datetime_range` + 随机数生成分区日志（3 天 × 4 端点 × 10 万行/天），写入 `logs/date=*/part-0.parquet`，运行 14.2 节管道并验证输出行数 = 3 天 × 24 小时 × 4 端点（= 288；管道按 hour × endpoint 分组）。
 2. **分区裁剪验证**：开启 `hive_partitioning=True` 后 filter 单个日期，用 explain 确认扫描文件列表从 3 个缩到 1 个；再用 glob 方式实现同样效果，对比两种方式的适用场景（值比较 vs 模式匹配）。
 3. **p99 对比**：把聚合中的 `quantile(0.99)` 分别换成 `max` 与 `mean`，三种口径下找出"最慢端点"是否一致？讨论监控该用哪个。
 4. **幂等验证**：连续运行两次 14.5 节的增量管道（anti join 版本），验证第二次输出的增量为 0 行。

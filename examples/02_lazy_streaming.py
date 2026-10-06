@@ -57,7 +57,7 @@ stats = pl.read_parquet(out)
 print(f"\n流式管道产出: {stats.height} 行（3 天 × 24 小时 × 4 端点 = 288）")
 print(stats.sort("hour", "endpoint").head(6))
 
-# --- 第 5 章：链式 vs 逐步赋值（计时对比；profile 自 1.43 起弃用，见 12.1 的替代工具）---
+# --- 第 5 章：链式 vs 逐步赋值（计时对比；profile 已于 2.0 移除，见 12.1 的替代工具）---
 import time
 
 df_eager = pl.read_parquet(WORK / "date=2026-08-*" / "*.parquet")

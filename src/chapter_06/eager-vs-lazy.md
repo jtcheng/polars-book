@@ -112,7 +112,7 @@ print((orders
    .join(users, on="user_id")
    .filter(pl.col("amount") > 100)
    .explain()))
-# 实测输出（polars 1.44.1）：
+# 实测输出（polars 2.0.0）：
 # INNER JOIN:
 # LEFT PLAN ON: [col("user_id")]
 #   Parquet SCAN [orders.parquet]

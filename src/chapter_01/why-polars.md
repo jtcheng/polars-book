@@ -126,7 +126,7 @@ lf = (
 t0 = time.perf_counter()
 result = lf.group_by("k").agg(pl.col("x").sum()).collect()
 print(f"1 亿行 group_by: {time.perf_counter() - t0:.2f}s")
-# 基准环境：Apple M2 Pro (10 核)，polars 1.44.1，典型值 ~0.5s
+# 基准环境：Apple M2 Pro (10 核)，polars 2.0.0，典型值 ~0.5s
 ```
 
 把 `pl.col("x").sum()` 换成 `pl.col("x").cast(pl.String)` 再试一次，就能体会数值与字符串处理的数量级差异（注意：两者输出形态不同——`sum` 每键产一个标量，`cast` 每键物化一个字符串列表，耗时差异同时来自类型转换与列表构建；练习 2 给了控制变量的对比方式）。join 负载的基准见第 10 章（哈希 join 的实测），字符串处理见第 9 章。

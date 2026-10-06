@@ -1,6 +1,6 @@
 # 附录 B 常用操作速查表
 
-> 按 namespace 分类编排，附常用分析操作模板（含 pandas 对照）。所有片段在 polars 1.44 实测通过。
+> 按 namespace 分类编排，附常用分析操作模板（含 pandas 对照）。所有片段在 polars 2.0 实测通过。
 
 ## B.1 读取与扫描
 
@@ -56,6 +56,8 @@ Categorical/Enum 选型：类别未知或会增长用 `Categorical`（跨字典 
 | 唯一计数 | `pl.col("x").n_unique()` | `df["x"].nunique()` |
 | 近似基数（大表） | `pl.col("x").approx_n_unique()` | — |
 | 直方图 | `s.hist(bin_count=10)`（Series 方法） | — |
+| 按断点分箱 | `pl.col("x").bin_intervals([0,10,20], labels=...)`（2.0：断点数+2 个区间，含两端无限区间，默认左开右闭） | `pd.cut(df["x"], [0,10,20])` |
+| 按分位数分箱 | `pl.col("x").bin_quantiles(4, labels=...)`（2.0，替代弃用的 `qcut`） | `pd.qcut(df["x"], 4)` |
 | 连续段编号 | `pl.col("x").rle_id()` | — |
 
 ## B.6 分组

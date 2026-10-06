@@ -86,7 +86,7 @@ df.select(
 - IQR 异常检测模板
 - 多级分组聚合与 `over` 窗口聚合的区别
 
-插值方法决定分位点落在两个观测之间时取什么值。对 [1, 2, 3, 4] 取 0.25 分位（polars 1.44.1 实测）：`linear` 得 1.75——虚拟位置 0.75 落在 1 与 2 之间，线性内插；`nearest` 得 2.0——取最近的观测；`lower` 得 1.0——取下侧相邻观测（对称地 `higher` 得 2.0，`midpoint` 取两侧平均 1.5）。注意 **polars 的默认插值是 `nearest`**，与 numpy/pandas 的默认（linear）不同——跨库对齐时务必显式写 `interpolation="linear"`，否则同一段数据两套库的分位数会悄悄错位；要求结果必须是真实观测值（门槛值、分层切点）时选 nearest 或 lower。IQR 模板必须运行在 `over` 窗口而非 `group_by().agg` 之上，这是本节的语义分水岭：agg 把每组收敛成一行、明细丢失，over 把组统计量广播回每行、行数不变——而异常检测的语义恰恰是"每行对照自己组的四分位"，行数一变就无从判定。
+插值方法决定分位点落在两个观测之间时取什么值。对 [1, 2, 3, 4] 取 0.25 分位（polars 2.0.0 实测）：`linear` 得 1.75——虚拟位置 0.75 落在 1 与 2 之间，线性内插；`nearest` 得 2.0——取最近的观测；`lower` 得 1.0——取下侧相邻观测（对称地 `higher` 得 2.0，`midpoint` 取两侧平均 1.5）。注意 **polars 的默认插值是 `nearest`**，与 numpy/pandas 的默认（linear）不同——跨库对齐时务必显式写 `interpolation="linear"`，否则同一段数据两套库的分位数会悄悄错位；要求结果必须是真实观测值（门槛值、分层切点）时选 nearest 或 lower。IQR 模板必须运行在 `over` 窗口而非 `group_by().agg` 之上，这是本节的语义分水岭：agg 把每组收敛成一行、明细丢失，over 把组统计量广播回每行、行数不变——而异常检测的语义恰恰是"每行对照自己组的四分位"，行数一变就无从判定。
 
 ```python
 # IQR 异常检测：分组内标准化
@@ -178,7 +178,7 @@ trades.join_asof(quotes, on="ts", strategy="backward")
 
 **join 顺序：谁为小表建哈希**
 
-哈希 join 必须先把一侧物化成哈希表（内表），另一侧流式探测。上面速查表把 inner 简记为"右表建哈希"，但 1.x 引擎实际会估算两侧规模、自动选较小的一侧做内表——不必为性能刻意调整 join 方向。实测（polars 1.44.1，Apple M 系列，1000 万行大表 × 1 万行小表，int64 键随机打乱，3 次取最优）：大表在左 9.2 ms，小表在左 8.7 ms——两侧差异在噪声级，1.44 引擎两侧自适应。两个注脚：① 把小表显式放在 `join()` 右侧（作为参数传入的一方）仍是稳妥习惯——"右表是查找表"的语义清晰，也不依赖当前引擎的内表选择策略；② 基准 join 前先打乱键——同数据两侧键有序时虽略有提速（实测约 7.6 ms），但会掩盖哈希 join 本身的行为，测不出引擎的典型性能。
+哈希 join 必须先把一侧物化成哈希表（内表），另一侧流式探测。上面速查表把 inner 简记为"右表建哈希"，但当前引擎实际会估算两侧规模、自动选较小的一侧做内表——不必为性能刻意调整 join 方向。实测（polars 2.0.0，Apple M 系列，1000 万行大表 × 1 万行小表，int64 键随机打乱，3 次取最优）：大表在左 9.2 ms，小表在左 8.7 ms——两侧差异在噪声级，2.0 引擎两侧自适应。两个注脚：① 把小表显式放在 `join()` 右侧（作为参数传入的一方）仍是稳妥习惯——"右表是查找表"的语义清晰，也不依赖当前引擎的内表选择策略；② 基准 join 前先打乱键——同数据两侧键有序时虽略有提速（实测约 7.6 ms），但会掩盖哈希 join 本身的行为，测不出引擎的典型性能。
 
 **join_where：非等值条件连接**
 
@@ -261,7 +261,7 @@ from glob import glob
 
 N = 16
 
-# 写侧：一次扫描，hash 取模分片落盘（PartitionBy 在 1.44 标记为 unstable）
+# 写侧：一次扫描，hash 取模分片落盘（PartitionBy 在 2.0 仍标记为 unstable）
 def shard_to(src: str, dst: str) -> None:
     (pl.scan_parquet(src)
        .with_columns(shard=pl.col("key").hash() % N)
@@ -282,7 +282,7 @@ for left_dir in sorted(glob("shards/left/shard=*")):
        .sink_parquet(f"out/{os.path.basename(left_dir)}.parquet"))
 ```
 
-实测（polars 1.44.1）：`pl.col("key").hash()` 返回 UInt64（如 13223116160119632573），`% 16` 得片号，同键必同片；`PartitionBy` 落盘为 `shard=N/00000000.parquet` 的目录布局，空片不写文件——所以读侧按实际存在的片目录配对，而不是 `for i in range(N)`。若不想用 unstable 的 `PartitionBy`，写侧可退化为逐片 `filter(pl.col("key").hash() % N == i)`，代价是 N 次全表扫描。
+实测（polars 2.0.0）：`pl.col("key").hash()` 返回 UInt64（如 13223116160119632573），`% 16` 得片号，同键必同片；`PartitionBy` 落盘为 `shard=N/00000000.parquet` 的目录布局，空片不写文件——所以读侧按实际存在的片目录配对，而不是 `for i in range(N)`。若不想用 unstable 的 `PartitionBy`，写侧可退化为逐片 `filter(pl.col("key").hash() % N == i)`，代价是 N 次全表扫描。
 
 **别忘了二次归并**：分片键是 `key`、聚合键是 `dim`——除非 `dim` 完全由 `key` 决定（同一 `dim` 必同片），否则各片 sink 出来的都是**部分聚合值**，同一个 `dim` 会散落在多个 `out/shard=*.parquet` 里。收尾必须再归并一次：
 

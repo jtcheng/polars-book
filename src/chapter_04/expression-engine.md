@@ -132,7 +132,7 @@ for _ in range(100_000):
     e = taxed                           # 循环内只是引用
 t_reuse = time.perf_counter() - t0
 print(f"每次新建: {t_build:.3f}s vs 复用: {t_reuse:.3f}s")
-# 实测：每次新建 ~0.14s vs 复用 ~0.002s —— 单个约 1.4 µs（polars 1.44.1）
+# 实测：每次新建 ~0.14s vs 复用 ~0.002s —— 单个约 1.4 µs（polars 2.0.0）
 ```
 
 日常几十上百个表达式完全无感；但要警惕在十万次级的热循环里每次重建表达式——累计 0.14 s 的纯构建开销（对照 4.3 节：100 万行的整列乘法才约 1 ms）。表达式是"图纸"不是"工件"：画一次，到处用。
@@ -169,7 +169,7 @@ sa, sb = pl.Series(a_np), pl.Series(b_np)
 t_pl = bench(lambda: sa + sb)
 print(f"NumPy {t_np * 1e3:.1f} ms vs Polars {t_pl * 1e3:.1f} ms")
 # 实测：两者相当，Polars 甚至可能略慢（带宽受限，多线程无利可图）
-# （polars 1.44.1：NumPy ~14 ms vs Polars ~34 ms；换成 sum()/group_by 等
+# （polars 2.0.0：NumPy ~14 ms vs Polars ~34 ms；换成 sum()/group_by 等
 #   计算密集操作，多线程优势才会显现——见第 7 章）
 ```
 
@@ -229,7 +229,7 @@ t0 = time.perf_counter()
 big.select(pl.col("x").map_elements(lambda v: v * 2))
 t_udf = time.perf_counter() - t0           # 实测 ~60 ms（视机器，慢解释器上可达数百 ms）
 print(f"表达式快 {t_udf / t_expr:.0f} 倍")
-# polars 1.44.1 实测：~0.9 ms vs ~58 ms，约 60 倍
+# polars 2.0.0 实测：~0.9 ms vs ~58 ms，约 60 倍
 ```
 
 ## 要点回顾

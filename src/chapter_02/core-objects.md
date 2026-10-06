@@ -146,6 +146,7 @@ print(s.to_numpy().__array_interface__["data"][0]
 | 浮点 | `Float32/Float64` | IEEE 754；null 与 NaN 是两套语义（见 2.2） |
 | 时间 | `Date`、`Datetime`、`Duration` | `Date` 是 i32 天数；`Datetime` 构造默认微秒精度 |
 | 嵌套 | `List`、`Array`、`Struct` | 变长列表 / 定宽定长 / 一行内的命名字段 |
+| 映射 | `Map(key, value)` | 2.0 新增：键值对字典（`map[str, i64]`），Arrow map 列直读，配套 `.map` 命名空间 |
 | 编码 | `String`、`Categorical`、`Enum` | 原生字符串缓冲 / 动态字典 / 固定字典 |
 
 时间类型的默认精度值得亲手确认一次：
@@ -161,11 +162,26 @@ print(df.schema["ts"])
 
 嵌套三兄弟一句话区分：`List` 每行长度可变（`[[1, 2], [3]]`）；`Array` 宽度写死在 dtype 里（`Array(Int64, 2)` 只装恰好两个元素，还能嵌套成多维）；`Struct` 是一行内的命名字段（`Struct({'x': Int64, 'y': String})`），相当于把宽表的一小段折叠进单列。
 
+**`Map` 是 2.0 新增的 dtype**：此前 Arrow map 列会被读成 `List(Struct({key, value}))`，取键值要绕 struct 字段；现在直接映射为 `pl.Map(key_dtype, value_dtype)`（显示为 `map[str, i64]`），并配套专用的 `.map` 命名空间（`get` 按键取值、`contains_key` 判断键存在、`keys`/`values` 拆出键列值列、`entries` 取回 key/value 结构）。从旧格式列迁移只需一次 cast；注意 map 的键不可重复——读取重复键时引擎取首个位置、末个值。适合标签对、配置对这类"每行的键集合不固定"的数据；键集合固定且全部已知时，`Struct` 仍是更优选择（列式布局、投影裁剪友好）。
+
+```python
+import polars as pl
+
+tags = pl.Series("tags", [{"lang": "py", "db": "pg"}, {"lang": "rs"}],
+                 dtype=pl.Map(pl.String, pl.String))
+tags.to_frame().select(
+    pl.col("tags").map.len().alias("n"),
+    pl.col("tags").map.get("lang").alias("lang"),
+    pl.col("tags").map.contains_key("db").alias("has_db"),
+)
+# n: [2, 1]  lang: ["py", "rs"]  has_db: [True, False]
+```
+
 编码三选一的取舍：高基数或近似唯一 → `String`；低基数且类别未知、会增长 → `Categorical`（字典随数据动态生长）；低基数且类别固定已知 → `Enum`（编译期校验取值，排序语义随声明固定，第 9 章）。
 
 ### String 不是 Python str 对象的集合
 
-pandas 的 object 列本质是 **PyObject 指针数组**：每个元素指向一个散落在 Python 堆上的 `str` 对象，任何比较/哈希/排序都要先解引用、再进解释器。Polars 的 `String` 列基于**变长字符串视图（binview）布局**：字符串字节集中存放在共享缓冲区，每行持有一个 16 字节定宽 view 结构（长度 + 缓冲区指针/偏移，外加 12 字节内联空间）——不超过 12 字节的字符串整个内联在 view 里，无需第二次访存；比较与哈希先比内联前缀即可快速淘汰大量候选。sort/filter/contains 等操作直接在缓冲区上向量化执行，全程不经过 Python 解释器。量级差异一句话：百万行 String 列 `sort()` 实测约 13 ms，同样数据转 Python 列表再 `sorted()` 约 104 ms——差的就是每个元素一次解释器对象开销（polars 1.44 / macOS arm64 实测）。
+pandas 的 object 列本质是 **PyObject 指针数组**：每个元素指向一个散落在 Python 堆上的 `str` 对象，任何比较/哈希/排序都要先解引用、再进解释器。Polars 的 `String` 列基于**变长字符串视图（binview）布局**：字符串字节集中存放在共享缓冲区，每行持有一个 16 字节定宽 view 结构（长度 + 缓冲区指针/偏移，外加 12 字节内联空间）——不超过 12 字节的字符串整个内联在 view 里，无需第二次访存；比较与哈希先比内联前缀即可快速淘汰大量候选。sort/filter/contains 等操作直接在缓冲区上向量化执行，全程不经过 Python 解释器。量级差异一句话：百万行 String 列 `sort()` 实测约 13 ms，同样数据转 Python 列表再 `sorted()` 约 104 ms——差的就是每个元素一次解释器对象开销（polars 2.0 / macOS arm64 实测）。
 
 ```python
 import random
@@ -186,7 +202,7 @@ sorted(col)   # ≈ 104 ms：百万次 PyObject 解引用 + 解释器比较
 ```python
 lf = pl.LazyFrame({"a": [1, 2], "b": ["x", "y"]})
 print(lf.collect_schema())   # Schema({'a': Int64, 'b': String})——官方姿势
-# lf.schema                  # 1.44 实测仍可用，但触发 PerformanceWarning，别写进生产代码
+# lf.schema                  # 2.0 实测仍可用，但触发 PerformanceWarning，别写进生产代码
 
 df = pl.DataFrame({"a": [1, 2]})
 print(df.schema)             # Schema({'a': Int64})（eager：schema 直接在手）

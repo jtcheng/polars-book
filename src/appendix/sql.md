@@ -21,9 +21,11 @@ df.sql("SELECT user_id, amount FROM self WHERE amount > 100")
 lf.sql("SELECT city, COUNT(*) AS n FROM self GROUP BY city")  # 返回 LazyFrame
 ```
 
+**2.0 起 SQL 侧有两点要留意**。其一，SQL 覆盖范围大幅提升（官方口径：SQL 成为"一等公民"），此前表达式 API 独占的能力正逐步补齐——本节列的覆盖缺口以你手头版本的运行时报错为准。其二，SQL 的解析与校验**延迟到 `collect()` 时**才发生：`pl.sql()` / `SQLContext.execute()` 调用时不再校验语法、表名列名，拼错列名的查询要到 collect（或先 `collect_schema()` 验证）才报错；附带的好处是含 SQL 的计划可以序列化、`SELECT *` 也推迟到 collect 时展开。
+
 ## A.2 与标准 SQL 的差异
 
-以下每条差异都在 polars 1.44 实测验证（1.44 尚无 `DATE_TRUNC`/`QUANTILE` 的 SQL 函数，写作时以运行时报错为准）：
+以下每条差异都在 polars 2.0 实测验证（2.0 尚无 `DATE_TRUNC`/`QUANTILE` 的 SQL 函数，写作时以运行时报错为准）：
 
 - **NULL 判断写 `IS NULL`，没有 `is_null()` 函数**：SQL 侧与标准 SQL 一致用 `IS NULL` / `IS NOT NULL`；表达式 API 侧的 `is_null()` 不能搬进 SQL。`WHERE x = NULL` 与标准 SQL 行为一致——不匹配任何行：
 

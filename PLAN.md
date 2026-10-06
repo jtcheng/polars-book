@@ -4,7 +4,7 @@
 > 第二阶段依据本文档实施：初始化 mdbook 项目、搭建 SUMMARY.md 骨架、配置 mermaid 预处理器。
 > **实施状态**：16 章正文 + 3 附录已完成；每章含代码示例、mermaid 图、练习题、性能检查清单；
 > 配套 `examples/`（4 个可运行脚本）与 `tests/`（pytest 校验）随书维护；
-> API 已对照 polars 1.44.1 与官方文档（docs.pola.rs）逐一核验。
+> API 已对照 polars 2.0.0 与官方文档（docs.pola.rs）逐一核验。
 
 ## 一、书籍定位
 
@@ -63,7 +63,7 @@ polars/
 | 9 | 数据清洗与变换 | 缺失值（validity bitmap）、cast 规则、字符串（多编码）、Categorical 的字典编码；**全流程以链式调用实现** | 清洗流程 flowchart |
 | 10 | 分组聚合与连接 | **基础聚合全家桶**：`sum` `mean` `median` `min/max` `std/var` `count` `len` `n_unique`；**百分位/分位数**：`quantile`（插值方法 linear/nearest/midpoint 的差异）、`q1/q3` 与 IQR 异常检测；多级分组与命名聚合（`pl.col(...).agg(...)`）；聚合结果展开（`explode` / `flatten`）；group_by 的多线程分区策略；**join 全家桶**：`inner` / `left` / `right` / `outer(coalesce)` / `cross` / `semi` / `anti`，各自语义、实现与代价；**`join_asof`** 最近邻时序连接；多键 join、join 顺序对性能的影响；窗口函数（`over`）；**超大数据集的流式 join/聚合策略** | join 策略决策树、join 类型集合示意图 |
 | 11 | 时间序列 | 日期底层表示、rolling 的并行化、重采样；**同比/环比专题**：`shift` + `group_by` 计算环比、`pct_change`、分组内 period-over-period（按年/月分组的同比）、`over` 窗口下的组内环比、缺失周期补齐（`upsample`）后再算环比 | 重采样时间轴图、环比/同比计算示意 flowchart |
-| 12 | 性能调优方法论 | profile 火焰分析；性能反模式（逐行操作、不必要的 collect、打断链式优化）；缓存局部性；基准测试陷阱 | 调优决策树 |
+| 12 | 性能调优方法论 | 热点定位三件工具（explain/分段计时/火焰图）；性能反模式（逐行操作、不必要的 collect、打断链式优化）；缓存局部性；基准测试陷阱 | 调优决策树 |
 | 13 | UDF 边界与生态互通 | map_elements 的性能悬崖；表达式 plugin（Rust 编译进引擎）；与 NumPy/Arrow/DuckDB 零拷贝互通 | 生态互操作架构图 |
 
 ### 第四部分：综合实战
@@ -155,7 +155,7 @@ flowchart TB
 | 上下文 | 关键方法 | 说明 |
 |---|---|---|
 | DataFrame | `select` `with_columns` `filter` `group_by` `join` `sort` `head/tail` `unique` `pivot` `melt` `explode` `to_arrow` | Eager，立即执行 |
-| LazyFrame | 同上 + `explain` `profile` `sink_parquet` `collect(engine=)` | 可优化、可流式 |
+| LazyFrame | 同上 + `explain` `sink_parquet` `collect(engine=)` | 可优化、可流式 |
 | Series | `to_list` `to_numpy` `is_sorted` `set_sorted` `zip_with` | 一维操作，多为语法糖 |
 
 ### 4.5 选择器 `cs`（`pl.selectors`）

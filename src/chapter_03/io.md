@@ -41,7 +41,7 @@ lf = (
 )
 print(lf.explain())
 # 输出中可见 SELECTION: col("amount") > 1000
-# 与 PROJECT 2/12 COLUMNS —— 12 列只读 2 列（polars 1.44.1 实测）
+# 与 PROJECT 2/12 COLUMNS —— 12 列只读 2 列（polars 2.0.0 实测）
 ```
 
 ## 3.2 各格式选型
@@ -203,7 +203,7 @@ def bench(pred):
 print(f"id > 9_990_000: {bench(pl.col('id') > 9_990_000) * 1e3:.1f} ms")
 print(f"id > 5_000_000: {bench(pl.col('id') > 5_000_000) * 1e3:.1f} ms")
 print(f"id > 1_000_000: {bench(pl.col('id') > 1_000_000) * 1e3:.1f} ms")
-# 实测（polars 1.44.1，Apple Silicon，页缓存热，5 次取最优）：
+# 实测（polars 2.0.0，Apple Silicon，页缓存热，5 次取最优）：
 # id > 9_990_000:   8.4 ms   —— 9/10 行组整块跳过，只解码最后 1 个行组
 # id > 5_000_000:  39.2 ms   —— 跳过 5/10
 # id > 1_000_000:  60.8 ms   —— 跳过 1/10
@@ -223,7 +223,7 @@ sample = pl.select(
 )
 for codec in ["zstd", "lz4", "snappy", "uncompressed"]:
     sample.write_parquet(f"events_{codec}.parquet", compression=codec)
-# 实测落盘大小（polars 1.44.1 / macOS arm64，100 万行 × 3 列整型）：
+# 实测落盘大小（polars 2.0.0 / macOS arm64，100 万行 × 3 列整型）：
 # zstd 1.4 MB ／ lz4 4.7 MB ／ snappy 6.2 MB ／ uncompressed 11.6 MB
 ```
 

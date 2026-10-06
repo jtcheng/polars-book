@@ -4,13 +4,13 @@ version = "0.1.0"
 description = "《Polars 高效数据处理实战》配套代码"
 requires-python = ">=3.11"
 dependencies = [
-    "duckdb>=1.5.5",
-    "polars[all]>=1.44.1",
+    "duckdb>=1.5.6",
+    "polars[all]>=2.0.0",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.1.1",
 ]
 
 [tool.pytest.ini_options]

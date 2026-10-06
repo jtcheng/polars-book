@@ -91,7 +91,7 @@ fn my_gcd(inputs: &[Series]) -> PolarsResult<Series> {
 2. Python 侧把动态库路径传给 `register_plugin_function`（也接受动态库所在目录）；
 3. 注册得到的是普通 `Expr`——可与原生表达式混用、进惰性管道，像内置函数一样参与优化。
 
-`register_plugin_function` 在 polars 1.44.1 的真实签名（`inspect.signature` 实测抄录，注释按官方文档字符串整理）：
+`register_plugin_function` 在 polars 2.0.0 的真实签名（`inspect.signature` 实测抄录，注释按官方文档字符串整理）：
 
 ```python
 register_plugin_function(
@@ -107,6 +107,8 @@ register_plugin_function(
     input_wildcard_expansion=False,   # 执行前先展开通配符表达式
     pass_name_to_apply=False,         # group_by 传入的 Series 附带列名（每组一次堆分配）
     use_abs_path=False,               # 把路径解析为绝对路径
+    is_deterministic=True,            # 相同输入必得相同输出（2.0 新增，默认 True；
+                                      # 标 False 时结果不进 CSE/缓存等依赖确定性的优化）
 )  # 返回 Expr
 ```
 
@@ -152,7 +154,7 @@ flowchart TB
 
 **与 Arrow**：`to_arrow` / `from_arrow` 走标准 Arrow 数据接口，两侧缓冲区满足对齐、连续等布局要求时零拷贝共享；不满足时（如偏移数组不对齐、需要重排缓冲区）退化为一次整块 memcpy——仍是低成本拷贝，不是逐值转换。
 
-**与 DuckDB**：`duckdb.sql` 能直接查询 Polars 的 DataFrame 与 LazyFrame（替换扫描经 Arrow 接入，不必先落盘），查询结果用 `rel.pl()` 以 Polars DataFrame 返回、`.df()` 以 pandas 返回。实测（polars 1.44.1 + duckdb 1.5.5）：对 `pl.scan_parquet` 得到的 LazyFrame 直接 `SELECT region, AVG(amount) ... GROUP BY region` 正常执行。
+**与 DuckDB**：`duckdb.sql` 能直接查询 Polars 的 DataFrame 与 LazyFrame（替换扫描经 Arrow 接入，不必先落盘），查询结果用 `rel.pl()` 以 Polars DataFrame 返回、`.df()` 以 pandas 返回。实测（polars 2.0.0 + duckdb 1.5.6）：对 `pl.scan_parquet` 得到的 LazyFrame 直接 `SELECT region, AVG(amount) ... GROUP BY region` 正常执行。
 
 ```python
 # NumPy 互通：把成熟的科学计算库接到管道里

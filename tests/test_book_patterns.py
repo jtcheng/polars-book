@@ -4,6 +4,8 @@
 """
 from datetime import date, datetime, timedelta
 
+import pytest
+
 import polars as pl
 
 
@@ -188,6 +190,57 @@ def test_ch11_from_epoch():
     out = pl.select(ts=pl.from_epoch(pl.Series([0, 60]), time_unit="s"))
     assert out["ts"].dt.second().to_list() == [0, 0]
     assert out["ts"].dt.minute().to_list() == [0, 1]
+
+
+# ---------- 第 2/9 章（polars 2.0 新 API）----------
+
+def test_ch02_map_dtype():
+    # Map dtype 与 .map 命名空间（2.0 新增；此前 Arrow map 列读成 List(Struct)）
+    tags = pl.Series("tags", [{"lang": "py", "db": "pg"}, {"lang": "rs"}],
+                     dtype=pl.Map(pl.String, pl.String))
+    out = tags.to_frame().select(
+        pl.col("tags").map.len().alias("n"),
+        pl.col("tags").map.get("lang").alias("lang"),
+        pl.col("tags").map.contains_key("db").alias("has_db"),
+    )
+    assert out["n"].to_list() == [2, 1]
+    assert out["lang"].to_list() == ["py", "rs"]
+    assert out["has_db"].to_list() == [True, False]
+
+
+def test_ch02_map_from_old_list_struct():
+    # 旧格式 List(Struct{key,value}) cast 到 Map——升级迁移路径
+    old = pl.Series("m", [[{"key": "a", "value": 1}, {"key": "b", "value": 2}]],
+                    dtype=pl.List(pl.Struct({"key": pl.String, "value": pl.Int64})))
+    mp = old.cast(pl.Map(pl.String, pl.Int64))
+    assert mp.map.get("a").to_list() == [1]
+
+
+def test_ch09_bin_intervals_and_quantiles():
+    # bin_intervals：断点数 + 2 个区间（含两端无限区间），默认左开右闭
+    v = pl.DataFrame({"v": [1.0, 5.0, 9.0, 15.0, 25.0]})
+    out = v.select(pl.col("v").bin_intervals(
+        [0, 10, 20, 30],
+        labels=["(-inf,0]", "(0,10]", "(10,20]", "(20,30]", "(30,inf)"],
+    ))
+    assert out["v"].to_list() == ["(0,10]", "(0,10]", "(0,10]", "(10,20]", "(20,30]"]
+
+    qs = v.select(pl.col("v").bin_quantiles(4, labels=["q1", "q2", "q3", "q4"]))
+    assert qs["v"].to_list() == ["q1", "q2", "q3", "q4", "q4"]
+
+
+def test_ch09_cat_to_and_physical():
+    # 整数 ↔ 分类互 cast 在 2.0 禁止，改用 .cat.to() / .cat.physical()
+    codes = pl.Series("x", [0, 1, 1, 0])
+    cat = codes.cat.to(pl.Enum(["a", "b"]))
+    assert cat.to_list() == ["a", "b", "b", "a"]
+    assert cat.cat.physical().to_list() == [0, 1, 1, 0]
+
+
+def test_appendix_c_removed_api_exception():
+    # 被移除的 API 抛类型化异常，错误信息指向替代写法
+    with pytest.raises(pl.exceptions.AttributeRemovedError):
+        pl.DataFrame({"a": [1]}).lazy().profile()
 
 
 # ---------- 附录 A：SQL 方言 ----------

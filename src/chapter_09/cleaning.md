@@ -81,7 +81,7 @@ for label, fn in [
         times.append(time.perf_counter() - t0)
     print(label, "%.2f ms" % (min(times) * 1e3))
 # 实测：is_null().sum() ≈ 0.07 ms；sum() ≈ 1.4 ms（无 null 同规模列 ≈ 0.6 ms）
-# 判空扫描的 bitmap 只有 625 KB——主数据的 1/64（polars 1.44 / macOS arm64）
+# 判空扫描的 bitmap 只有 625 KB——主数据的 1/64（polars 2.0 / macOS arm64）
 ```
 
 `fill_null` / `forward_fill` 的实现思路同样是单遍扫描：内核顺序走过数据与 bitmap，逐块决定每行的输出来源——常数填充只看当前位的取值；前向填充只需维护"最近一次见到的非 null 值"这一个状态，无需逐行回调，也无需回看。
@@ -92,7 +92,9 @@ for label, fn in [
 - 数值降宽（Int64 → Int32）的溢出风险
 - `to_datetime` 的格式显式声明
 
-cast 的设计哲学是"快失败"：默认 strict 让脏数据在转换点当场报错，定位在发生处；`strict=False` 把失败吞成 null、管道不中断，代价是发现被推迟到下游——生产管道用前者保正确性，一次性脏数据探查用后者统计转不动的行数。降宽的溢出同样是显式失败而非静默截断：实测（polars 1.44.1）Int64 的 30 亿 cast 到 Int32，strict 下抛 `InvalidOperationError`，`strict=False` 下变 null——真正的风险不在引擎而在流程：没人确认过上界，自增 id 迟早突破 21 亿。日期解析要求显式格式也是同一原则——推断可能猜错格式，显式声明把歧义消灭在读入时。
+cast 的设计哲学是"快失败"：默认 strict 让脏数据在转换点当场报错，定位在发生处；`strict=False` 把失败吞成 null、管道不中断，代价是发现被推迟到下游——生产管道用前者保正确性，一次性脏数据探查用后者统计转不动的行数。降宽的溢出同样是显式失败而非静默截断：实测（polars 2.0.0）Int64 的 30 亿 cast 到 Int32，strict 下抛 `InvalidOperationError`，`strict=False` 下变 null——真正的风险不在引擎而在流程：没人确认过上界，自增 id 迟早突破 21 亿。日期解析要求显式格式也是同一原则——推断可能猜错格式，显式声明把歧义消灭在读入时。
+
+2.0 把"快失败"推到底：**模糊的隐式 cast 被整体移除**。三个高频场景现在必须走专用路径——字符串转时间类型不再允许 `cast(pl.Date)`（改用 `.str.to_date()` / `.str.to_datetime()`，格式声明是参数而非玄学）；整数与 Categorical/Enum 之间不再允许互 cast（int→分类用 `.cat.to(dtype)`，分类→物理索引用 `.cat.physical()`，语义各归其名）；`is_in()` 的类型转换改为严格——Int64 与 Float64 比较不再有损对齐（旧版超过 2⁵³ 的整数会被静默舍入造成误匹配），类型不兼容直接抛 `InvalidOperationError`，要跨类型就显式 cast。原则没变：引擎不猜，你声明。
 
 ```python
 # strict（默认）：转换失败直接报错——生产管道推荐
@@ -122,7 +124,7 @@ df.with_columns(pl.col("flag").cast(pl.Int8))   # 上限 127
 - 多编码：`len_bytes` vs `len_chars`
 - 正则的预编译与回退成本
 
-`.str` 命名空间快在执行层级：每个方法对应一个列级向量化内核，一次原生调用处理整列，而不是 Python 层的逐行调度——这是它能留在快路径的原因，也是边界：内核没实现的复杂逻辑才需要退到 `map_elements`。`len_chars` 与 `len_bytes` 的分歧来自 UTF-8 变长编码——"数据"两个字符占 6 个字节——截断、过滤、分箱时选错语义，中文场景直接出错。正则的成本另算：`literal=True` 走纯子串搜索，进正则引擎则模式越复杂常数越大（实测 200 万行 `contains("hij")`：literal 约 14 ms，正则模式 `ab.*hij` 约 40 ms，约 3 倍差距；polars 1.44.1 / macOS arm64）——高频路径上的字面量匹配值得显式声明。
+`.str` 命名空间快在执行层级：每个方法对应一个列级向量化内核，一次原生调用处理整列，而不是 Python 层的逐行调度——这是它能留在快路径的原因，也是边界：内核没实现的复杂逻辑才需要退到 `map_elements`。`len_chars` 与 `len_bytes` 的分歧来自 UTF-8 变长编码——"数据"两个字符占 6 个字节——截断、过滤、分箱时选错语义，中文场景直接出错。正则的成本另算：`literal=True` 走纯子串搜索，进正则引擎则模式越复杂常数越大（实测 200 万行 `contains("hij")`：literal 约 14 ms，正则模式 `ab.*hij` 约 40 ms，约 3 倍差距；polars 2.0.0 / macOS arm64）——高频路径上的字面量匹配值得显式声明。
 
 ```python
 df = pl.DataFrame({
@@ -171,7 +173,7 @@ df = pl.DataFrame({"city": ["上海"] * 500_000 + ["北京"] * 500_000})
 print(df.estimated_size("mb"))                            # String: ~5.7 MB
 print(df.with_columns(pl.col("city").cast(pl.Categorical))
         .estimated_size("mb"))                            # ~3.8 MB
-# 实测值：100 万行、2 个类别，polars 1.44 / macOS arm64
+# 实测值：100 万行、2 个类别，polars 2.0 / macOS arm64
 # 注意：estimated_size 对 String 列未计入每行 16 字节的 view 结构，
 # String 列的真实内存还要再加约 16 MB——字典编码的真实收益比数字显示的更大
 
@@ -180,9 +182,23 @@ Weekday = pl.Enum(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
 df.with_columns(pl.col("dow").cast(Weekday))
 ```
 
-### 跨字典 join 的自动 remap（1.x 行为）
+### 跨字典 join 的自动 remap 与 2.0 的 Categories
 
 两个 Categorical 列即使字典各自独立——同一个字符串在左右两侧映射到不同的物理索引——join 也不会出错：引擎在比较前先把一侧的字典**重映射（remap）到另一侧的编码空间**，对齐物理索引后再做等值连接。0.x 时代这需要全局 `pl.enable_string_cache()`（让所有 Categorical 共享一张字典），1.x 已彻底移除该要求，跨字典 Categorical join 直接可用、无需任何全局开关。
+
+2.0 在此基础上引入了**命名字典 `Categories`**：`cast(pl.Categorical())` 不传参仍用全局字典（行为与 1.x 相同，join 自动 remap）；而 `cast(pl.Categorical(categories="airport"))` 把列钉进一张命名编码空间——它换来的保证是：同名字典的两列物理索引**保证一致**，join/concat 无需任何 remap；代价是**混用即报错**：不同名字典的列 join 直接抛 `SchemaError`（concat 同样报 "Categories name mismatch"），引擎不再做隐式重映射。选择逻辑与 Enum 一脉相承：默认全局字典方便但隐式，命名字典显式但快失败——多个管道/多张表共享同一套取值时，命名字典把"编码空间契约"从约定变成类型的一部分。
+
+```python
+# 全局字典（默认）：跨字典 join 自动 remap，1.x 行为不变
+left.join(right, on="k")            # ✅ 引擎先 remap 再等值连接
+
+# 命名字典：同名字典保证物理索引一致，混用即报错
+codes = pl.DataFrame({"k": ["PEK", "SHA"]}).with_columns(
+    pl.col("k").cast(pl.Categorical(categories="airport"))
+)
+flights.join(codes, on="k")          # 同为 "airport" 字典：零 remap 直接比对
+# ❌ 不同名字典：SchemaError——引擎拒绝隐式 remap，把契约错配暴露在转换点
+```
 
 要留意的坑只剩一个：**Categorical 与 Enum 混用**。两侧 join 键 dtype 不一致（`cat` 对 `enum`）时，引擎不会自动选边 cast，直接抛 `SchemaError`。需要显式统一，方向规则是：`Enum → Categorical` 总是可行；`Categorical → Enum` 要求列中每个取值都在 Enum 的类别声明里，多出一个就报 `InvalidOperationError`——这正是 Enum 的编译期校验在保护你。
 
@@ -201,7 +217,7 @@ enum_side.with_columns(pl.col("d").cast(pl.Categorical)).join(cat_side, on="d")
 
 ### Categorical 的 sort 顺序：physical vs lexical
 
-字典编码列的排序有两种语义：**lexical**（按字符串本身的次序）与 **physical**（按字典索引，即类别首次出现的顺序）。用于切换的 `Categorical(ordering="physical"/"lexical")` 参数已废弃（1.44 实测触发 `DeprecationWarning`，官方口径：排序恒为 lexical，2.0 将移除该参数）——Categorical 的 `sort()` 恒为 lexical；要按出现顺序排，就显式排物理索引列 `to_physical()`。`Enum` 则不同：排序恒按**类别声明的顺序**，语义在定义时就固定，这也是它"固定字典"红利的另一面。
+字典编码列的排序有两种语义：**lexical**（按字符串本身的次序）与 **physical**（按字典索引，即类别首次出现的顺序）。用于切换的 `Categorical(ordering="physical"/"lexical")` 参数已废弃（1.44 实测触发 `DeprecationWarning`，官方口径：排序恒为 lexical，2.0 已移除该参数，构造签名改为 `Categorical(categories=...)`）——Categorical 的 `sort()` 恒为 lexical；要按出现顺序排，就显式排物理索引列 `to_physical()`。`Enum` 则不同：排序恒按**类别声明的顺序**，语义在定义时就固定，这也是它"固定字典"红利的另一面。
 
 ```python
 df = pl.DataFrame({"fruit": ["banana", "apple", "cherry", "apple"]})

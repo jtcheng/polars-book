@@ -46,11 +46,15 @@ df.write_parquet("out.parquet")
 ## 8.2 new streaming engine
 
 - 新流式引擎（1.41+ 进入 stable）取代了旧流式引擎：旧引擎只让部分节点流式、靠 `explain` 的 STREAMING 标记识别；新引擎整条管道默认以 morsel 为单元流式执行
-- `collect(engine="streaming")` 显式选用新引擎（默认 `engine="auto"`，2.0 起流式将成为默认引擎）
+- `collect()` 默认 `engine="auto"`——**2.0 起 auto 直接解析为流式引擎**（此前解析为 in-memory），`engine="streaming"` 的显式指定成为冗余但无害的习惯写法
 - morsel 机制：分块读取 → 分块处理 → 分块写出
 - 峰值内存控制原理
 
 要点在"默认"二字：引擎不再逐节点挑选谁能流式，而是整条管道统一以 morsel 为单位推进——读一块、算一块、写一块，管道任何位置都不必见到全量数据。峰值内存因此可控，机制上可拆成三层：单个 morsel 的工作集上限固定，任一时刻驻留内存的只有当前这一块，与输入总量无关；算子之间以有界缓冲衔接，上游产一批、下游消一批，背压约束之下中间结果不会整层物化；聚合状态是唯一的例外，它随基数而非数据量增长。三层叠加，内存账单上与数据量相关的项全部清零、只剩基数一项——这正是 8.1 末尾"O(基数) 而非 O(数据量)"的机制来源。
+
+默认切到流式的代价写在主版本号里：**join、group_by、unpivot 等操作不再默认保证输出行序**。旧行为只作为兜底保留：单次查询 `collect(engine="in-memory")` 或全局 `pl.Config.set_engine_affinity("in-memory")` 可回退；要行序但不想换引擎，用 `maintain_order=True`（如 `join(..., maintain_order="left")`，代价是放弃部分并行归并）。判断你的管道是否受影响只看一条：下游是否依赖"行序隐含信息"（如"第一行即最新"）——依赖就显式 sort 或加 maintain_order，不依赖（绝大多数聚合管道）就什么都不用改。
+
+性能侧的官方账本：流式默认 + 引擎改进（join 重排序、公共子计划消除增强、动态谓词/布隆过滤器）让官方在 TPC-H/TPC-DS 衍生基准上于几乎所有查询领先同期的 DuckDB 与 DataFusion，官方称默认路径整体约 5 倍于旧默认。数字属于特定环境，照例以你自己的负载复测为准（第 12 章）；已知边界是核数很大时存在固定调度开销，小数据查询在 32 核限制下反而更有竞争力。
 
 ```python
 # 流式 collect：结果仍是 DataFrame，但中间过程流式
@@ -81,11 +85,11 @@ sink_lf.collect()   # 此刻才真正执行；返回空 DataFrame，数据已在
 flowchart TD
     OP{"操作类型"} -->|"filter / select / with_columns<br/>（逐行无状态）"| YES["天然流式<br/>逐 morsel 处理"]
     OP -->|"group_by.agg<br/>（有限基数）"| YES2["流式<br/>增量哈希聚合"]
-    OP -->|"sort / unique<br/>（全序依赖）"| OOC["流式（out-of-core）<br/>1.42+ 内存不足时溢写磁盘<br/>内存充足时退回全内存更快"]
-    OP -->|"join 大表"| OOC2["流式（out-of-core）<br/>1.42+ 同上"]
+    OP -->|"sort / unique<br/>（全序依赖）"| OOC["流式（out-of-core）<br/>内存不足时溢写磁盘（2.0 默认启用）<br/>内存充足时退回全内存更快"]
+    OP -->|"join 大表"| OOC2["流式（out-of-core）<br/>同上（group_by/join 核外仍在路线图）"]
 ```
 
-新引擎下 sort/join 支持 out-of-core：内存不足时把中间数据溢写磁盘、逐块归并，代价是 I/O；内存充足时仍走全内存路径，速度更快。仍有少数复杂算子（如某些跨块全局窗口）可能退回全内存执行，以实测为准。
+新引擎下 sort 等全序算子支持 out-of-core：内存不足时把中间数据溢写磁盘、逐块归并，代价是 I/O；内存充足时仍走全内存路径，速度更快。2.0 起溢写**默认启用**：内存占用达到约 80% RAM 时开始溢写，默认磁盘预算 64GB——当前支持溢写的有 sort、窗口函数与多数表达式，join/group_by 的核外支持还在路线图上（所以 8.5 的基数纪律仍然必要）。仍有少数复杂算子可能退回全内存执行，以实测为准。
 
 ### 验证手段：实测峰值内存
 
@@ -167,7 +171,7 @@ lf.group_by("user_id").agg(pl.len())
 ## 要点回顾
 
 - scan → 变换 → sink 全程内存 O(分块) 而非 O(全量)
-- 新流式引擎（1.41+）整条管道默认以 morsel 为单元流式执行；验证靠实测峰值 RSS，而非旧的 STREAMING 标记
+- 新流式引擎（1.41+）整条管道默认以 morsel 为单元流式执行，2.0 起成为 collect 的默认引擎（join/group_by/unpivot 不再保证行序）；验证靠实测峰值 RSS，而非旧的 STREAMING 标记
 - 聚合基数是流式可行性的决定因素
 
 ## 性能检查清单

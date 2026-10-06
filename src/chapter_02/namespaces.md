@@ -45,9 +45,10 @@ flowchart TB
 |---|---|---|
 | `.str` | String | `contains` `split` `replace` `slice` `to_datetime` `strip_chars` `len_bytes` `pad_start` |
 | `.dt` | Date/Datetime/Duration | `year` `month` `weekday` `hour` `truncate` `offset_by` `total_seconds` `round` |
-| `.cat` | Categorical/Enum | `physical` `slice` `starts_with` `ends_with` `len_chars`（`get_categories` 已弃用：Categorical 看取值用 `unique()`，Enum 看类别表用 `dtype.categories`，2.0 将移除） |
+| `.cat` | Categorical/Enum | `physical` `to` `slice` `starts_with` `ends_with` `len_chars` `len_bytes`（`get_categories` 已在 2.0 移除：Categorical 看取值用 `unique()`，Enum 看类别表用 `dtype.categories`） |
 | `.list` | List | `len` `get` `first` `join` `sum` `min` `eval` `unique` |
 | `.struct` | Struct | `field` `json_encode` `rename_fields` `unnest` |
+| `.map` | Map（2.0 新增） | `get` `contains_key` `keys` `values` `entries` `len`（键值对字典：按键取值、拆键/值列） |
 | `.bin` | Binary | `contains` `decode` `size` |
 | `.name` | 任意列 | `keep` `map` `prefix` `suffix` `to_uppercase`（`prefix_fields`/`suffix_fields` 仅用于 Struct 字段） |
 | `.meta` | 任意表达式 | `has_multiple_outputs` `root_names` `output_name`（调试/元编程） |
@@ -69,7 +70,7 @@ flowchart TB
 | 上下文 | 关键方法 | 说明 |
 |---|---|---|
 | DataFrame | `select` `with_columns` `filter` `group_by` `join` `sort` `head/tail` `unique` `pivot` `unpivot`（1.0 前叫 `melt`）`explode` `to_arrow` | Eager，立即执行 |
-| LazyFrame | 同上 + `explain` `sink_parquet` `collect(engine=)`（`profile` 自 1.43 起弃用，为旧引擎专用） | 可优化、可流式 |
+| LazyFrame | 同上 + `explain` `sink_parquet` `collect(engine=)`（`profile` 1.43 弃用、2.0 已移除，为旧引擎专用） | 可优化、可流式 |
 | Series | `to_list` `to_numpy` `is_sorted` `set_sorted` `zip_with` | 一维操作，多为语法糖 |
 
 ## 选择器 cs（pl.selectors）
